@@ -8,8 +8,8 @@
     <SchemaVersion>2.0</SchemaVersion>
     <ProjectGuid>{50ADF1E3-8DB5-49C9-B519-BEBA3030B7BD}</ProjectGuid>
     <OutputType>WinExe</OutputType>
-    <StartupObject>CEA2045Sim.My.MyApplication</StartupObject>
-    <RootNamespace>CEA2045Sim</RootNamespace>
+    <StartupObject>CTA2045Sim.My.MyApplication</StartupObject>
+    <RootNamespace>CTA2045Sim</RootNamespace>
     <AssemblyName>CTA2045Sim</AssemblyName>
     <FileAlignment>512</FileAlignment>
     <MyType>WindowsForms</MyType>
@@ -26,9 +26,14 @@
     <UpdatePeriodically>false</UpdatePeriodically>
     <UpdateRequired>false</UpdateRequired>
     <MapFileExtensions>true</MapFileExtensions>
-    <ApplicationRevision>97</ApplicationRevision>
-    <ApplicationVersion>1.0.0.%2a</ApplicationVersion>
+    <TargetCulture>en-US</TargetCulture>
+    <ProductName>CTA-2045 Desktop Simulator</ProductName>
+    <PublisherName>EPRI</PublisherName>
+    <SuiteName>Demand Response</SuiteName>
+    <ApplicationRevision>114</ApplicationRevision>
+    <ApplicationVersion>19.08.22.%2a</ApplicationVersion>
     <UseApplicationTrust>false</UseApplicationTrust>
+    <CreateDesktopShortcut>true</CreateDesktopShortcut>
     <PublishWizardCompleted>true</PublishWizardCompleted>
     <BootstrapperEnabled>true</BootstrapperEnabled>
   </PropertyGroup>
@@ -41,6 +46,8 @@
     <OutputPath>bin\Debug\</OutputPath>
     <DocumentationFile>CTA2045Sim.xml</DocumentationFile>
     <NoWarn>42016,41999,42017,42018,42019,42032,42036,42020,42021,42022</NoWarn>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <CodeAnalysisRuleSet>AllRules.ruleset</CodeAnalysisRuleSet>
   </PropertyGroup>
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|x86' ">
     <PlatformTarget>x86</PlatformTarget>
@@ -51,12 +58,14 @@
     <OutputPath>bin\Release\</OutputPath>
     <DocumentationFile>CTA2045Sim.xml</DocumentationFile>
     <NoWarn>42016,41999,42017,42018,42019,42032,42036,42020,42021,42022</NoWarn>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <CodeAnalysisRuleSet>AllRules.ruleset</CodeAnalysisRuleSet>
   </PropertyGroup>
   <PropertyGroup>
     <OptionExplicit>On</OptionExplicit>
   </PropertyGroup>
   <PropertyGroup>
-    <OptionCompare>Binary</OptionCompare>
+    <OptionCompare>Text</OptionCompare>
   </PropertyGroup>
   <PropertyGroup>
     <OptionStrict>Off</OptionStrict>
@@ -65,10 +74,10 @@
     <OptionInfer>On</OptionInfer>
   </PropertyGroup>
   <PropertyGroup>
-    <ManifestCertificateThumbprint>1F6CE1271FF19CE6F46FC2E3931A763220FE9550</ManifestCertificateThumbprint>
+    <ManifestCertificateThumbprint>7962B9977BE69889B745B7D610E398A37739BB3C</ManifestCertificateThumbprint>
   </PropertyGroup>
   <PropertyGroup>
-    <ManifestKeyFile>AppPlugSimSend_TemporaryKey.pfx</ManifestKeyFile>
+    <ManifestKeyFile>CTA2045-A Desktop Simulator.pfx</ManifestKeyFile>
   </PropertyGroup>
   <PropertyGroup>
     <GenerateManifests>true</GenerateManifests>
@@ -76,12 +85,25 @@
   <PropertyGroup>
     <SignManifests>false</SignManifests>
   </PropertyGroup>
+  <PropertyGroup>
+    <ApplicationManifest>My Project\app.manifest</ApplicationManifest>
+  </PropertyGroup>
+  <PropertyGroup>
+    <TargetZone>LocalIntranet</TargetZone>
+  </PropertyGroup>
+  <PropertyGroup>
+    <SignAssembly>false</SignAssembly>
+  </PropertyGroup>
+  <PropertyGroup>
+    <ApplicationIcon>cta2045.ico</ApplicationIcon>
+  </PropertyGroup>
   <ItemGroup>
     <Reference Include="System" />
     <Reference Include="System.Data" />
     <Reference Include="System.Deployment" />
     <Reference Include="System.Drawing" />
     <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Windows.Forms.DataVisualization" />
     <Reference Include="System.Xml" />
     <Reference Include="System.Core" />
     <Reference Include="System.Xml.Linq" />
@@ -100,10 +122,24 @@
     <Import Include="System.Xml.Linq" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="Form2.Designer.vb">
-      <DependentUpon>Form2.vb</DependentUpon>
+    <Compile Include="AboutBox.Designer.vb">
+      <DependentUpon>AboutBox.vb</DependentUpon>
     </Compile>
-    <Compile Include="Form2.vb">
+    <Compile Include="AboutBox.vb">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="ApplicationEvents.vb" />
+    <Compile Include="CommodityChart.Designer.vb">
+      <DependentUpon>CommodityChart.vb</DependentUpon>
+    </Compile>
+    <Compile Include="CommodityChart.vb">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="GlobalSuppressions.vb" />
+    <Compile Include="License.Designer.vb">
+      <DependentUpon>License.vb</DependentUpon>
+    </Compile>
+    <Compile Include="License.vb">
       <SubType>Form</SubType>
     </Compile>
     <Compile Include="Main_Form.vb">
@@ -128,10 +164,34 @@
       <DependentUpon>Settings.settings</DependentUpon>
       <DesignTimeSharedInput>True</DesignTimeSharedInput>
     </Compile>
+    <Compile Include="NewHeader.Designer.vb">
+      <DependentUpon>NewHeader.vb</DependentUpon>
+    </Compile>
+    <Compile Include="NewHeader.vb">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="TestHeader.Designer.vb">
+      <DependentUpon>TestHeader.vb</DependentUpon>
+    </Compile>
+    <Compile Include="TestHeader.vb">
+      <SubType>Form</SubType>
+    </Compile>
+    <Compile Include="TestReport.Designer.vb">
+      <DependentUpon>TestReport.vb</DependentUpon>
+    </Compile>
+    <Compile Include="TestReport.vb">
+      <SubType>Form</SubType>
+    </Compile>
   </ItemGroup>
   <ItemGroup>
-    <EmbeddedResource Include="Form2.resx">
-      <DependentUpon>Form2.vb</DependentUpon>
+    <EmbeddedResource Include="AboutBox.resx">
+      <DependentUpon>AboutBox.vb</DependentUpon>
+    </EmbeddedResource>
+    <EmbeddedResource Include="CommodityChart.resx">
+      <DependentUpon>CommodityChart.vb</DependentUpon>
+    </EmbeddedResource>
+    <EmbeddedResource Include="License.resx">
+      <DependentUpon>License.vb</DependentUpon>
     </EmbeddedResource>
     <EmbeddedResource Include="Main_Form.resx">
       <DependentUpon>Main_Form.vb</DependentUpon>
@@ -139,13 +199,23 @@
     </EmbeddedResource>
     <EmbeddedResource Include="My Project\Resources.resx">
       <Generator>VbMyResourcesResXFileCodeGenerator</Generator>
-      <LastGenOutput>Resources.Designer.vb</LastGenOutput>
       <CustomToolNamespace>My.Resources</CustomToolNamespace>
       <SubType>Designer</SubType>
+      <LastGenOutput>Resources.Designer.vb</LastGenOutput>
+    </EmbeddedResource>
+    <EmbeddedResource Include="NewHeader.resx">
+      <DependentUpon>NewHeader.vb</DependentUpon>
+    </EmbeddedResource>
+    <EmbeddedResource Include="TestHeader.resx">
+      <DependentUpon>TestHeader.vb</DependentUpon>
+    </EmbeddedResource>
+    <EmbeddedResource Include="TestReport.resx">
+      <DependentUpon>TestReport.vb</DependentUpon>
     </EmbeddedResource>
   </ItemGroup>
   <ItemGroup>
-    <None Include="AppPlugSim_TemporaryKey.pfx" />
+    <None Include="app.config" />
+    <None Include="My Project\app.manifest" />
     <None Include="My Project\Application.myapp">
       <Generator>MyApplicationCodeGenerator</Generator>
       <LastGenOutput>Application.Designer.vb</LastGenOutput>
@@ -155,11 +225,15 @@
       <CustomToolNamespace>My</CustomToolNamespace>
       <LastGenOutput>Settings.Designer.vb</LastGenOutput>
     </None>
+    <Content Include="cta2045.ico" />
+    <Content Include="Resources\CTA-2045_Simulator_User_Guide.chm">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
   <ItemGroup>
-    <BootstrapperPackage Include=".NETFramework,Version=v4.0,Profile=Client">
+    <BootstrapperPackage Include=".NETFramework,Version=v4.6">
       <Visible>False</Visible>
-      <ProductName>Microsoft .NET Framework 4 Client Profile %28x86 and x64%29</ProductName>
+      <ProductName>Microsoft .NET Framework 4.6 %28x86 and x64%29</ProductName>
       <Install>true</Install>
     </BootstrapperPackage>
     <BootstrapperPackage Include="Microsoft.Net.Client.3.5">
@@ -172,17 +246,9 @@
       <ProductName>.NET Framework 3.5 SP1</ProductName>
       <Install>false</Install>
     </BootstrapperPackage>
-    <BootstrapperPackage Include="Microsoft.Windows.Installer.4.5">
-      <Visible>False</Visible>
-      <ProductName>Windows Installer 4.5</ProductName>
-      <Install>true</Install>
-    </BootstrapperPackage>
   </ItemGroup>
   <ItemGroup>
-    <None Include="Resources\EPRI logo 2014_RGB.jpg" />
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="Resources\EPRI logo 2014_RGB_308x57.jpg" />
+    <EmbeddedResource Include="Resources\EPRI_logo_RGB-2%40300.png" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.VisualBasic.targets" />
   <!-- To modify your build process, add your task inside one of the targets below and uncomment it. 

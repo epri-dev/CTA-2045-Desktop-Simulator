@@ -39,6 +39,9 @@
 ' 
 '  @author Gary Aumaugher, Electric Power Research Institute, gaumaugher@epri.com
 '  @date 12/7/2016
+'
+'  @modified by Simon Boka, Electric Power Research Institute, sboka@epri.com
+'  @date 10/8/2019
 ' ***************************************************************************
 
 ' ***************************************************************************
@@ -60,8 +63,10 @@ Imports System.Threading
 Imports System.IO.Ports
 Imports System.IO
 
+<Assembly: CLSCompliant(False)>
+
 Public Class FrmMain
-    Public Structure commodityDef
+    Public Structure CommodityDef
         'Public responseCode As Byte
         Public supported As Boolean
         Public estimated As Boolean
@@ -71,8 +76,8 @@ Public Class FrmMain
         Public updateFreq As Integer
     End Structure
 
-    Dim commodityArray(8) As commodityDef       'This contains commodity data from this device
-    Dim commodityArray2(8) As commodityDef      'This contains received commodity data from other device
+    Dim commodityArray(10) As CommodityDef       'This contains commodity data from this device
+    Dim commodityArray2(10) As CommodityDef      'This contains received commodity data from other device
     Dim myPort As Array  'COM Ports detected on the system will be stored here
     Dim connectStatus As Boolean 'True if serial port is connected
     Dim receiveData As String
@@ -164,13 +169,18 @@ Public Class FrmMain
     Dim rxMsgOverflow As Boolean            'Set to true if message received is larger than receive buffer
     Dim rxMsgOversize As Boolean            'Set to true if message received is larger than connected device max message size
     Dim messageCounter As Integer           'Debugging for lockup up after hours of operation
-
+    Dim realDeviceData(1440) As Integer     'Data values from file for real device SGD simulation
+    Dim gridMode As String
+    Dim preference(256) As Byte             'Preference value by type
+    Dim actStatus(256) As Byte              'Activation status by index
+    Public testHeaderSaveFile As String
+    Dim ignoreOverrideChange As Boolean
 
     Delegate Sub SetTextCallback(ByVal [text] As String)
     Delegate Sub SetTextCallback2(ByVal byteString As String, ByVal engString As String) 'Added to prevent threading errors during receiveing of data
     Delegate Sub SetTextCallback3(ByRef text As String) 'Added to prevent threading errors during receiveing of data
 
-    Private Sub frmMain_Load(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles MyBase.Load
+    Private Sub FrmMain_Load(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles MyBase.Load
         Dim i As Integer
         Dim tempstr As String
 
@@ -181,7 +191,7 @@ Public Class FrmMain
             For Each tempstr In myPort
                 i += 1
             Next
-            If i = 0 Then
+            If i = 0 Then ' TODO : Evaluate this section  
                 MsgBox("No serial ports were found. Please connect a CTA 2045 Simulator cable before executing the application.")
                 Me.Close()
             End If
@@ -214,6 +224,7 @@ Public Class FrmMain
             CommStatus = 0
             cmbCommStatus.SelectedIndex = 1
             cmbGridGuide.SelectedIndex = 1
+            cbActResponse.SelectedIndex = 0
             commStatusText(0) = "Lost Connection"
             commStatusText(1) = "Good Connection"
             commStatusText(2) = "Poor Connection"
@@ -299,11 +310,12 @@ Public Class FrmMain
             realSGDNeutralResponse.SelectedIndex = 0
             realSGDNoCommTimeoutValBox.Value = 300
             preGuidanceOpState = 0
-            autoCommStatusTimer.Interval = 60000         'set interval to 10 second
+            autoCommStatusTimer.Interval = 10000         'set interval to 10 second
             commStatusTimoutTmr.Interval = 1000
             preShedOpState = 0
             commStatusTimeoutTime = realSGDNoCommTimeoutValBox.Value
             cbVerboseLog.Checked = True
+            cbAutoStartup.Checked = True
             badOpcode1valbox.Value = &H89
             badOpcode2valbox.Value = &H89
             badOpcode1valbox.Enabled = False
@@ -319,14 +331,31 @@ Public Class FrmMain
             MaxPayloadSizeCd = 2
             rxMsgOverflow = False
             rxMsgOversize = False
-
+            gridMode = "Normal"
+            lbCommodityCode1.SelectedItem() = lbCommodityCode1.Items.Item(0)
+            testHeaderSaveFile = ""
+            pendEventTypeCb.SelectedIndex = 1
+            tbPendEventTime.Text = "0"
+            tbPendEventType.Text = "End Shed/Run Normal"
+            cbRebootType.SelectedIndex = 0
+            tbCEA2045Version.Text = "0"
+            pbGetEnergyPrice.Visible = False
+            dtpExpTime.Value.ToFileTimeUtc()
+            For i = 0 To 255
+                preference(i) = 0
+            Next
+            For i = 0 To 255
+                actStatus(i) = 0
+            Next
+            ignoreOverrideChange = False
+            cbInterRespCode.SelectedIndex = 0
         Catch ex As Exception
             MessageBox.Show("Error occured in Sub frmMain_Load: " & ex.Message)
         End Try
 
     End Sub
 
-    Private Sub btnConnect_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles btnConnect.Click
+    Private Sub BtnConnect_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles btnConnect.Click
         Dim tmpstr As String
 
         Try
@@ -355,18 +384,24 @@ Public Class FrmMain
                     'Names the default log file
                     tbLogFile.Text = Directory.GetCurrentDirectory() & "\ucmlog.csv"
                 End If
-                populateDeviceInfo(0)
+                PopulateDeviceInfo(0)
+                pbGetEnergyPrice.Visible = False
+                pbSetEnergyPrice.Visible = True
             Else
                 ucmTabControl.Visible = False    'We are in SGD - Appliance mode
                 sgdTabControl.Visible = True
                 realUCMFunctionsGroup.Visible = False
                 realSGDFunctionsGroup.Visible = True
                 commonCommandsTabControl.Visible = True
+                'remove extra commodity features in sgd mode
+                cdCommodityGb.Visible = False
                 If tbLogFile.Text = "" Then
                     'Names the default log file
                     tbLogFile.Text = Directory.GetCurrentDirectory() & "\sgdlog.csv"
                 End If
-                populateDeviceInfo(1)
+                PopulateDeviceInfo(1)
+                pbGetEnergyPrice.Visible = True
+                pbSetEnergyPrice.Visible = False
             End If
 
             'Disables UCM/SGD radio buttons
@@ -376,24 +411,33 @@ Public Class FrmMain
             'logFile.Enabled = False
             pbExecuteScript.Enabled = True
             testScriptbtn.Enabled = True
+            AddHeaderBtn.Enabled = True
+            GenReportBtn.Enabled = True
 
             'Assumes no entries have been made to device data, and they must be re-entered
             cea2045VersionOK = False
             deviceTypeOK = False
 
+            'Copies selected header file to log if selected
+            If testHeaderSaveFile <> "" Then
+                My.Computer.FileSystem.CopyFile(testHeaderSaveFile, tbLogFile.Text, True)
+            End If
+
             'Adds blank lines, time, and header to log file to signify the starting of the simulator
             tmpstr = ControlChars.CrLf
             tmpstr &= DateDiff("s", #1/1/2000#, DateTime.Now) & DateTime.Now.ToString(".fff") & ", "
             tmpstr &= (((Convert.ToDecimal(DateDiff("s", #1/1/2000#, DateTime.Now))) / 86400) + 36526).ToString & ","
-            tmpstr &= "Simulator v16.12.07 is starting as "
+            tmpstr &= "Simulator v18.12.24 is starting as "
             If rbMode1.Checked = True Then
                 tmpstr &= "UCM"
             Else
                 tmpstr &= "SGD"
             End If
             tmpstr &= ",UCM Sent:,SGD Sent:"
-            sendToLog("", tmpstr)
+            SendToLog("", tmpstr)
             bitrate = CmbBaud.Text
+
+            CbAutoStartup_CheckedChanged(sender, e)
 
         Catch ex As Exception
             MessageBox.Show("Error occured in Sub btnConnect_Click: " & ex.Message)
@@ -401,7 +445,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub btnDisconnect_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles btnDisconnect.Click
+    Private Sub BtnDisconnect_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles btnDisconnect.Click
         Try
             SerialPort1.Close()             'Close our Serial Port
             btnConnect.Enabled = True
@@ -422,6 +466,8 @@ Public Class FrmMain
             pbExecuteScript.Enabled = False
             testScriptbtn.Enabled = False
             cbResponseSim.Checked = False
+            AddHeaderBtn.Enabled = False
+            GenReportBtn.Enabled = False
 
         Catch ex As Exception
             MessageBox.Show("Error occured in Sub btnDisconnect_Click: " & ex.Message)
@@ -551,12 +597,12 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub cmbBaudText(ByVal [text] As String)
+    Private Sub CmbBaudText(ByVal [text] As String)
         'compares the ID of the creating Thread to the ID of the calling Thread
         Try
 
             If Me.CmbBaud.InvokeRequired Then
-                Dim x As New SetTextCallback(AddressOf cmbBaudText)
+                Dim x As New SetTextCallback(AddressOf CmbBaudText)
                 Me.Invoke(x, New Object() {(text)})
             Else
                 Me.CmbBaud.Text = [text]
@@ -566,7 +612,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub cmbPort_SelectedIndexChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles CmbPort.SelectedIndexChanged
+    Private Sub CmbPort_SelectedIndexChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles CmbPort.SelectedIndexChanged
         'Dim i As Integer
 
         Try
@@ -603,7 +649,7 @@ Public Class FrmMain
                 'This is a Pass Through that does not need a check sum added
                 SerialPort1.Write(dataout, 0, count) 'Write the string to the serial port as bytes
                 dispString &= ByteToHexString(dataout, "Sent", count)    'Display the received data in the text box
-                sendToLog(dispString, "Sent Raw Pass Through message")
+                SendToLog(dispString, "Sent Raw Pass Through message")
                 ReceivedText(dispString, "Sent Raw Pass Through message")
             ElseIf count > 2 Then
                 'This is a normal message rather than link ack or nak
@@ -630,10 +676,10 @@ Public Class FrmMain
                                 'This message type is not in the list
                                 If cbResponseSim.Checked = True Then
                                     MsgBox("Do not send a message type that has not been confirmed to be supported")
-                                    reset_state()
+                                    Reset_state()
                                     Exit Sub
                                 Else
-                                    sendToLog(dispString, "Do not send a message type that has not been confirmed to be supported")
+                                    SendToLog(dispString, "Do not send a message type that has not been confirmed to be supported")
                                     ReceivedText(dispString, "Do not send a message type that has not been confirmed to be supported")
                                 End If
                             End If
@@ -667,7 +713,7 @@ Public Class FrmMain
                 'Check if message is too large to transmit in 500ms at the current baud rate
                 If (count * 8000) / bitrate > tMLValBox.Value Then
                     MsgBox("Message too long to trasmit in " & tMLValBox.Value & "ms at the current baud rate!")
-                    reset_state()
+                    Reset_state()
                     Exit Sub
                 End If
 
@@ -675,7 +721,7 @@ Public Class FrmMain
                 If MaxPayloadSizeCd < (count - 4) Then
                     If cbResponseSim.Checked = True Then
                         ReceivedText("", "Simulator tried to send message bigger than connected device max payload")
-                        reset_state()
+                        Reset_state()
                         Exit Sub
                     Else
                         ReceivedText("", "Simulator sending message bigger than connected device max payload")
@@ -697,9 +743,9 @@ Public Class FrmMain
 
                 End If
 
-                dispString &= ByteToHexString(dataout, "Sent", (count + 2))    'Display the received data in the text box
+                dispString &= ByteToHexString(dataout, "Sent", (count + 2))    'Display the sent data in the text box
 
-                sendToLog(dispString, comment)
+                SendToLog(dispString, comment)
                 ReceivedText(dispString, comment)
                 If pendLinkAck = True Then
                     pendingAckTime = DateTime.Now
@@ -710,10 +756,10 @@ Public Class FrmMain
                 SerialPort1.Write(dataout, 0, count) 'Write the string to the serial port as bytes
                 dispString &= ByteToHexString(dataout, "Sent", count)    'Display the received data in the text box
                 If dataout(0) = &H6 Then
-                    sendToLog(dispString, "Sent Link Ack")
+                    SendToLog(dispString, "Sent Link Ack")
                     ReceivedText(dispString, "Sent Link Ack")
                 Else
-                    sendToLog(dispString, "Sent Link Nak")
+                    SendToLog(dispString, "Sent Link Nak")
                     ReceivedText(dispString, "Sent Link Nak")
                 End If
 
@@ -727,7 +773,7 @@ Public Class FrmMain
     'Processes information going to the log file
     'bytestring is in format datestamp recieve/send bytes
     'engString is a comment that should describe what the bytes mean
-    Private Sub sendToLog(ByVal byteString As String, ByVal engString As String)
+    Private Sub SendToLog(ByVal byteString As String, ByVal engString As String)
         Dim tmp() As String
         Dim tempstring As String
 
@@ -859,6 +905,11 @@ Public Class FrmMain
         Dim checksum2 As Int16 = 0
         Dim tempchar As Int16
 
+        'Add more room for checksum if needed
+        If senddata.Length Mod chrCount < 2 Then
+            Array.Resize(senddata, chrCount + 2)
+        End If
+
         Try
             For I = 0 To (chrCount - 1) Step 1
                 checksum1 += senddata(I)
@@ -875,7 +926,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Public Function verifyChecksum(ByVal receivedData() As Byte, ByVal chrCount As Integer) As Boolean
+    Public Function VerifyChecksum(ByVal receivedData() As Byte, ByVal chrCount As Integer) As Boolean
         'Calculates the Fletcher Checksum (16-bit 1's complement) on chrCount number of bytes in the 
         'receivedData array then compares that to the checksum stored in the following 2 indexes.
         'Arguments: 
@@ -887,26 +938,31 @@ Public Class FrmMain
         Dim tempchar, tempchar2 As Int16
 
         Try
-            For I = 0 To (chrCount - 1) Step 1
-                checksum1 += receivedData(I)
-                checksum1 = checksum1 Mod 255
-                checksum2 += checksum1
-                checksum2 = checksum2 Mod 255
-            Next I
-            tempchar = 255 - ((checksum1 + checksum2) Mod 255)
-            tempchar2 = 255 - ((checksum1 + tempchar) Mod 255)
+            If (receivedData(0) = 8 And (receivedData(1) > 0 And receivedData(1) < 5)) Or (receivedData(0) = 9) Then
+                For I = 0 To (chrCount - 1) Step 1
+                    checksum1 += receivedData(I)
+                    checksum1 = checksum1 Mod 255
+                    checksum2 += checksum1
+                    checksum2 = checksum2 Mod 255
+                Next I
+                tempchar = 255 - ((checksum1 + checksum2) Mod 255)
+                tempchar2 = 255 - ((checksum1 + tempchar) Mod 255)
 
-            verifyChecksum = False
-            If (tempchar = receivedData(chrCount) And tempchar2 = receivedData(chrCount + 1)) Then
-                verifyChecksum = True
+                VerifyChecksum = False
+                If (tempchar = receivedData(chrCount) And tempchar2 = receivedData(chrCount + 1)) Then
+                    VerifyChecksum = True
+                End If
+            Else
+                'Message is not valid
+                VerifyChecksum = False
             End If
         Catch ex As Exception
             MessageBox.Show("Error occured in Function verifyChecksum: " & ex.Message)
-            verifyChecksum = False
+            VerifyChecksum = False
         End Try
     End Function
 
-    Private Sub tbarPower_Scroll(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles tbarPower.Scroll
+    Private Sub TbarPower_Scroll(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles tbarPower.Scroll
         Dim powerLevel As Single
 
         Try
@@ -917,7 +973,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub rbProduced_CheckedChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles rbProduced.CheckedChanged
+    Private Sub RbProduced_CheckedChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles rbProduced.CheckedChanged
         Try
             If rbProduced.Checked = True Then
                 rbAbsorbed.Checked = False
@@ -930,7 +986,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub rbAbsorbed_CheckedChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles rbAbsorbed.CheckedChanged
+    Private Sub RbAbsorbed_CheckedChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles rbAbsorbed.CheckedChanged
         Try
             If rbAbsorbed.Checked = True Then
                 rbProduced.Checked = False
@@ -943,7 +999,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub btnTimeSyncOn_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles btnTimeSyncOn.Click
+    Private Sub BtnTimeSyncOn_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles btnTimeSyncOn.Click
         Dim tempTime As Long
 
         Try
@@ -964,7 +1020,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub btnTimeSyncOff_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles btnTimeSyncOff.Click
+    Private Sub BtnTimeSyncOff_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles btnTimeSyncOff.Click
         Try
             TimeSyncEnable = False
             btnTimeSyncOff.Enabled = False
@@ -974,7 +1030,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub btnClearDebug_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles btnClearDebug.Click
+    Private Sub BtnClearDebug_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles btnClearDebug.Click
         Try
             rtbReceived.Text = ""
             scriptFeedBox.Text = ""
@@ -983,7 +1039,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub trkShedDur_Scroll(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles trkShedDur.Scroll
+    Private Sub TrkShedDur_Scroll(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles trkShedDur.Scroll
         Dim duration As Long
         Dim durHours As Byte
         Dim durMin As Byte
@@ -1002,7 +1058,7 @@ Public Class FrmMain
         End If
     End Sub
 
-    Public Function byteToDurationStr(ByVal byteDur As Byte)
+    Public Function ByteToDurationStr(ByVal byteDur As Byte)
         Dim duration As Long
         Dim durHours As Byte
         Dim durMin As Byte
@@ -1010,28 +1066,28 @@ Public Class FrmMain
         Dim tempInt As UInteger
 
         If byteDur = 0 Then
-            byteToDurationStr = "Unknown"
+            ByteToDurationStr = "Unknown"
         ElseIf byteDur = &HFF Then
-            byteToDurationStr = ("> Maximum")
+            ByteToDurationStr = ("> Maximum")
         Else
             tempInt = byteDur
             duration = (tempInt * tempInt) * 2
             durHours = duration \ 3600
             durMin = (duration Mod 3600) \ 60
             durSec = duration Mod 60
-            byteToDurationStr = durHours.ToString("00") & ":" & durMin.ToString("00") & ":" & durSec.ToString("00")
+            ByteToDurationStr = durHours.ToString("00") & ":" & durMin.ToString("00") & ":" & durSec.ToString("00")
         End If
     End Function
 
-    Public Function byteToRelativePrice(ByVal bytePrice As Byte)
+    Public Function ByteToRelativePrice(ByVal bytePrice As Byte)
         Dim tempSingle As Single
 
         Try
             tempSingle = ((bytePrice - 1.0) * (bytePrice + 63.0)) / 8192
-            byteToRelativePrice = tempSingle.ToString("0.00")
+            ByteToRelativePrice = tempSingle.ToString("0.00")
         Catch ex As Exception
             MessageBox.Show("Error occured in Function byteToRelativePrice: " & ex.Message)
-            byteToRelativePrice = 0
+            ByteToRelativePrice = 0
         End Try
     End Function
 
@@ -1039,7 +1095,7 @@ Public Class FrmMain
     ' The following sections handle the UCM and SGD Basic commands initiated by button presses
     '=================================================================================================
 
-    Private Sub btnShedSend_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles btnShedSend.Click
+    Private Sub BtnShedSend_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles btnShedSend.Click
         Dim xmitBuffer(8) As Byte
         Dim rtnval As Integer
 
@@ -1058,16 +1114,16 @@ Public Class FrmMain
             shedEventTime = (trkShedDur.Value * trkShedDur.Value) * 2
         End If
 
-        rtnval = getLinkAck()
+        rtnval = GetLinkAck()
         If rtnval = 0 Then
             'Wait for Application Ack
-            rtnval = getApplicationAck(1)
+            rtnval = GetApplicationAck(1)
         End If
-        reset_state()
+        Reset_state()
         tmrProcessComm.Enabled = True
     End Sub
 
-    Private Sub btnEndShed_Click(sender As System.Object, e As System.EventArgs) Handles btnEndShed.Click
+    Private Sub BtnEndShed_Click(sender As System.Object, e As System.EventArgs) Handles btnEndShed.Click
         Dim xmitBuffer(8) As Byte
         Dim rtnval As Integer
 
@@ -1082,16 +1138,16 @@ Public Class FrmMain
         SendComData(xmitBuffer, 6, "Sent an End Shed/Run Normal Command", pendingLinkAck)
         shedEventTimer.Enabled = False
 
-        rtnval = getLinkAck()
+        rtnval = GetLinkAck()
         If rtnval = 0 Then
             'Wait for Application Ack
-            rtnval = getApplicationAck(2)
+            rtnval = GetApplicationAck(2)
         End If
-        reset_state()
+        Reset_state()
         tmrProcessComm.Enabled = True
     End Sub
 
-    Private Sub btnRPLAccept_Click(sender As System.Object, e As System.EventArgs) Handles btnRPLAccept.Click
+    Private Sub BtnRPLAccept_Click(sender As System.Object, e As System.EventArgs) Handles btnRPLAccept.Click
         Dim xmitBuffer(8) As Byte
         Dim powerValue As Byte
         Dim rtnval As Integer
@@ -1111,16 +1167,16 @@ Public Class FrmMain
         SendComData(xmitBuffer, 6, "Sent request for Power Level", pendingLinkAck)
         expectingResponse = True
 
-        rtnval = getLinkAck()
+        rtnval = GetLinkAck()
         If rtnval = 0 Then
             'Wait for Application Ack
-            rtnval = getApplicationAck(6)
+            rtnval = GetApplicationAck(6)
         End If
-        reset_state()
+        Reset_state()
         tmrProcessComm.Enabled = True
     End Sub
 
-    Private Sub presentPriceButton_Click(sender As Object, e As EventArgs) Handles presentPriceButton.Click
+    Private Sub PresentPriceButton_Click(sender As Object, e As EventArgs) Handles presentPriceButton.Click
         Dim xmitBuffer(8) As Byte
         Dim rtnval As Integer
 
@@ -1135,16 +1191,16 @@ Public Class FrmMain
         SendComData(xmitBuffer, 6, "Sent Present Price", pendingLinkAck)
         expectingResponse = True
 
-        rtnval = getLinkAck()
+        rtnval = GetLinkAck()
         If rtnval = 0 Then
             'Wait for Application Ack
-            rtnval = getApplicationAck(7)
+            rtnval = GetApplicationAck(7)
         End If
-        reset_state()
+        Reset_state()
         tmrProcessComm.Enabled = True
     End Sub
 
-    Private Sub nextPeriodPriceButton_Click(sender As Object, e As EventArgs) Handles nextPeriodPriceButton.Click
+    Private Sub NextPeriodPriceButton_Click(sender As Object, e As EventArgs) Handles nextPeriodPriceButton.Click
         Dim xmitBuffer(8) As Byte
         Dim rtnval As Integer
 
@@ -1160,16 +1216,16 @@ Public Class FrmMain
         SendComData(xmitBuffer, 6, "Sent Next Period Price", pendingLinkAck)
         expectingResponse = True
 
-        rtnval = getLinkAck()
+        rtnval = GetLinkAck()
         If rtnval = 0 Then
             'Wait for Application Ack
-            rtnval = getApplicationAck(8)
+            rtnval = GetApplicationAck(8)
         End If
-        reset_state()
+        Reset_state()
         tmrProcessComm.Enabled = True
     End Sub
 
-    Private Sub timeRemainingButton_Click(sender As Object, e As EventArgs) Handles timeRemainingButton.Click
+    Private Sub TimeRemainingButton_Click(sender As Object, e As EventArgs) Handles timeRemainingButton.Click
         Dim xmitBuffer(8) As Byte
         Dim rtnval As Integer
 
@@ -1185,16 +1241,16 @@ Public Class FrmMain
         SendComData(xmitBuffer, 6, "Sent Time Remaining", pendingLinkAck)
         expectingResponse = True
 
-        rtnval = getLinkAck()
+        rtnval = GetLinkAck()
         If rtnval = 0 Then
             'Wait for Application Ack
-            rtnval = getApplicationAck(9)
+            rtnval = GetApplicationAck(9)
         End If
-        reset_state()
+        Reset_state()
         tmrProcessComm.Enabled = True
     End Sub
 
-    Private Sub criticalPeakButton_Click(sender As Object, e As EventArgs) Handles criticalPeakButton.Click
+    Private Sub CriticalPeakButton_Click(sender As Object, e As EventArgs) Handles criticalPeakButton.Click
         Dim xmitBuffer(8) As Byte
         Dim rtnval As Integer
 
@@ -1214,16 +1270,16 @@ Public Class FrmMain
             loadUpEventTimer.Enabled = False
         End If
 
-        rtnval = getLinkAck()
+        rtnval = GetLinkAck()
         If rtnval = 0 Then
             'Wait for Application Ack
-            rtnval = getApplicationAck(&HA)
+            rtnval = GetApplicationAck(&HA)
         End If
-        reset_state()
+        Reset_state()
         tmrProcessComm.Enabled = True
     End Sub
 
-    Private Sub gridEmergencyButton_Click(sender As Object, e As EventArgs) Handles gridEmergencyButton.Click
+    Private Sub GridEmergencyButton_Click(sender As Object, e As EventArgs) Handles gridEmergencyButton.Click
         Dim xmitBuffer(8) As Byte
         Dim rtnval As Integer
 
@@ -1243,16 +1299,16 @@ Public Class FrmMain
             loadUpEventTimer.Enabled = False
         End If
 
-        rtnval = getLinkAck()
+        rtnval = GetLinkAck()
         If rtnval = 0 Then
             'Wait for Application Ack
-            rtnval = getApplicationAck(&HB)
+            rtnval = GetApplicationAck(&HB)
         End If
-        reset_state()
+        Reset_state()
         tmrProcessComm.Enabled = True
     End Sub
 
-    Private Sub sendGuidenceButton_Click(sender As Object, e As EventArgs) Handles sendGuidenceButton.Click
+    Private Sub SendGuidenceButton_Click(sender As Object, e As EventArgs) Handles sendGuidenceButton.Click
         Dim xmitBuffer(8) As Byte
         Dim rtnval As Integer
 
@@ -1267,16 +1323,16 @@ Public Class FrmMain
         SendComData(xmitBuffer, 6, "Sent Grid Guidance: " & cmbGridGuide.SelectedIndex, pendingLinkAck)
         expectingResponse = True
 
-        rtnval = getLinkAck()
+        rtnval = GetLinkAck()
         If rtnval = 0 Then
             'Wait for Application Ack
-            rtnval = getApplicationAck(&HC)
+            rtnval = GetApplicationAck(&HC)
         End If
-        reset_state()
+        Reset_state()
         tmrProcessComm.Enabled = True
     End Sub
 
-    Private Sub sendCommStatus(ByVal status As Byte)
+    Private Sub SendCommStatus(ByVal status As Byte)
         Dim xmitBuffer(8) As Byte
         Dim rtnval As Integer
 
@@ -1291,48 +1347,16 @@ Public Class FrmMain
         SendComData(xmitBuffer, 6, "Sent Comm Status", pendingLinkAck)
         expectingResponse = True
 
-        rtnval = getLinkAck()
+        rtnval = GetLinkAck()
         If rtnval = 0 Then
             'Wait for Application Ack
-            rtnval = getApplicationAck(&HE)
+            rtnval = GetApplicationAck(&HE)
         End If
-        reset_state()
+        Reset_state()
         tmrProcessComm.Enabled = True
     End Sub
 
-    Private Sub chkCustOverride_CheckedChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles chkCustOverride.CheckedChanged
-        Dim xmitBuffer(8) As Byte
-        Dim rtnval As Integer
-
-        tmrProcessComm.Enabled = False
-        CustomerOverride = chkCustOverride.Checked
-        receiveIndex = 0
-        xmitBuffer(0) = 8
-        xmitBuffer(1) = 1
-        xmitBuffer(2) = 0
-        xmitBuffer(3) = 2
-        xmitBuffer(4) = &H11
-        If chkCustOverride.Checked = True Then
-            xmitBuffer(5) = 1
-            SendComData(xmitBuffer, 6, "Sent Customer Override in Effect", pendingLinkAck)
-            overRideSet = True
-        Else
-            xmitBuffer(5) = 0
-            SendComData(xmitBuffer, 6, "Sent Customer Override Not in Effect", pendingLinkAck)
-            overRideSet = False
-        End If
-        expectingResponse = True
-
-        rtnval = getLinkAck()
-        If rtnval = 0 Then
-            'Wait for Application Ack
-            rtnval = getApplicationAck(&H11)
-        End If
-        reset_state()
-        tmrProcessComm.Enabled = True
-    End Sub
-
-    Private Sub pbOpState_Click(sender As System.Object, e As System.EventArgs) Handles pbOpState.Click
+    Private Sub PbOpState_Click(sender As System.Object, e As System.EventArgs) Handles pbOpState.Click
         Dim xmitBuffer(8) As Byte
         Dim rtnval As Integer
 
@@ -1349,15 +1373,15 @@ Public Class FrmMain
         SendComData(xmitBuffer, 6, "Sent Op State Query", pendingLinkAck)
         expectingResponse = True
 
-        If getLinkAck() = 0 Then
+        If GetLinkAck() = 0 Then
             'Wait for State Query Response
-            rtnval = getStateQueryResp()
+            rtnval = GetStateQueryResp()
         End If
-        reset_state()
+        Reset_state()
         tmrProcessComm.Enabled = True
     End Sub
 
-    Private Sub pbLoadUp_Click(sender As Object, e As EventArgs) Handles pbLoadUp.Click
+    Private Sub PbLoadUp_Click(sender As Object, e As EventArgs) Handles pbLoadUp.Click
         Dim xmitBuffer(8) As Byte
         Dim rtnval As Integer
 
@@ -1376,12 +1400,12 @@ Public Class FrmMain
             shedEventTime = (trkShedDur.Value * trkShedDur.Value) * 2
         End If
 
-        rtnval = getLinkAck()
+        rtnval = GetLinkAck()
         If rtnval = 0 Then
             'Wait for Application Ack
-            rtnval = getApplicationAck(&H17)
+            rtnval = GetApplicationAck(&H17)
         End If
-        reset_state()
+        Reset_state()
         tmrProcessComm.Enabled = True
     End Sub
 
@@ -1389,7 +1413,7 @@ Public Class FrmMain
     ' The following sections handle the Link commands initiated by button presses
     '=================================================================================================
 
-    Private Sub msgTypeQuery_Click(sender As Object, e As EventArgs) Handles msgTypeQuery.Click
+    Private Sub MsgTypeQuery_Click(sender As Object, e As EventArgs) Handles msgTypeQuery.Click
         Dim xmitBuffer(6) As Byte
         Dim rtnval As Integer
         Dim dispString As String
@@ -1409,7 +1433,7 @@ Public Class FrmMain
         SendComData(xmitBuffer, 4, "Sent Message Supported Query", pendingLinkAck)      'Append checksum and send message
         expectingResponse = True
 
-        rtnval = getLinkAck()
+        rtnval = GetLinkAck()
         If rtnval = 0 Then
             'Message type is supported
             'Assume if the other device is asking then it supports this message type
@@ -1441,7 +1465,7 @@ Public Class FrmMain
             dispString &= "0x" & Conversion.Hex(msgType(0)) & " 0x" & Conversion.Hex(msgType(1))
             ReceivedText("", dispString)
         End If
-        reset_state()
+        Reset_state()
         tmrProcessComm.Enabled = True
 
     End Sub
@@ -1450,7 +1474,7 @@ Public Class FrmMain
     ' The following sections handle are the support subs for the basic, link and intermediate commands
     '=================================================================================================
 
-    Public Function getLinkAck() As Integer
+    Public Function GetLinkAck() As Integer
         ' Returns 0 = Link Ack, -1 = timeout, -2 Link Nak
         Dim pendingTime As System.DateTime
         Dim rightNowTime As System.DateTime
@@ -1470,10 +1494,10 @@ Public Class FrmMain
                 If deltaMS > 200 Then   '200ms is default - tie to box on screen
                     'Timed out waiting for link Ack/Nak
                     dispString = ByteToHexString(tempRxBuff, "Recv", tempRxPtr)    'Display the received data in the text box and log file
-                    sendToLog(dispString, "Error - Timed out waiting for Link Ack/Nak-2")
+                    SendToLog(dispString, "Error - Timed out waiting for Link Ack/Nak-2")
                     ReceivedText(dispString, "Error - Timed out waiting for Link Ack/Nak-2")
-                    reset_state()
-                    getLinkAck = -1
+                    Reset_state()
+                    GetLinkAck = -1
                     Exit Do
                 End If
             Else
@@ -1481,44 +1505,44 @@ Public Class FrmMain
                 dispString = ""
                 dispString = ByteToHexString(receiveBuffer, "Recv", receiveIndex)       'Display the received data in the text box and log file
                 If receiveBuffer(0) = 6 And receiveBuffer(1) = 0 Then 'This is a link Ack
-                    sendToLog(dispString, "Link Ack Received")
+                    SendToLog(dispString, "Link Ack Received")
                     ReceivedText(dispString, "Link Ack Received")
-                    getLinkAck = 0
+                    GetLinkAck = 0
                 ElseIf receiveBuffer(0) = &H15 And receiveIndex >= 2 Then 'This is a link Nack
-                    getLinkAck = -2
+                    GetLinkAck = -2
                     Select Case receiveBuffer(1)
                         Case 0
-                            sendToLog(dispString, "Link Nak Received: 0x0 No Reason Given")
+                            SendToLog(dispString, "Link Nak Received: 0x0 No Reason Given")
                             ReceivedText(dispString, "Link Nak Received: 0x0 No Reason Given")
                         Case 1  'This case should never occur. Simulator has no way of catching this error
-                            sendToLog(dispString, "Link Nak Received: 0x1 Invalid Byte")
+                            SendToLog(dispString, "Link Nak Received: 0x1 Invalid Byte")
                             ReceivedText(dispString, "Link Nak Received: 0x1 Invalid Byte")
                         Case 2
-                            sendToLog(dispString, "Link Nak Received: 0x2 Invalid Length")
+                            SendToLog(dispString, "Link Nak Received: 0x2 Invalid Length")
                             ReceivedText(dispString, "Link Nak Received: 0x2 Invalid Length")
                         Case 3
-                            sendToLog(dispString, "Link Nak Received: 0x3 Checksum Error")
+                            SendToLog(dispString, "Link Nak Received: 0x3 Checksum Error")
                             ReceivedText(dispString, "Link Nak Received: 0x3 Checksum Error")
                         Case 4
-                            sendToLog(dispString, "Link Nak Received: 0x4 Reserved")
+                            SendToLog(dispString, "Link Nak Received: 0x4 Reserved")
                             ReceivedText(dispString, "Link Nak Received: 0x4 Reserved")
                         Case 5
-                            sendToLog(dispString, "Link Nak Received: 0x5 Message Timeout")
+                            SendToLog(dispString, "Link Nak Received: 0x5 Message Timeout")
                             ReceivedText(dispString, "Link Nak Received: 0x5 Message Timeout")
                         Case 6
-                            sendToLog(dispString, "Link Nak Received: 0x6 Unsupported Message Type")
+                            SendToLog(dispString, "Link Nak Received: 0x6 Unsupported Message Type")
                             ReceivedText(dispString, "Link Nak Received: 0x6 Unsupported Message Type")
                         Case 7
-                            sendToLog(dispString, "Link Nak Received: 0x7 Request Not Supported")
+                            SendToLog(dispString, "Link Nak Received: 0x7 Request Not Supported")
                             ReceivedText(dispString, "Link Nak Received: 0x7 Request Not Supported")
                         Case Else
-                            sendToLog(dispString, "Unknown Link Nak Received: " & Conversion.Hex(receiveBuffer(1)))
+                            SendToLog(dispString, "Unknown Link Nak Received: " & Conversion.Hex(receiveBuffer(1)))
                             ReceivedText(dispString, "Unknown Link Nak Received :" & Conversion.Hex(receiveBuffer(1)))
                     End Select
                 Else
-                    sendToLog(dispString, "Invalid response received")
+                    SendToLog(dispString, "Invalid response received")
                     ReceivedText(dispString, "Invalid response received")
-                    getLinkAck = 0
+                    GetLinkAck = 0
                 End If
                 Exit Do
             End If
@@ -1527,7 +1551,7 @@ Public Class FrmMain
 
     End Function
 
-    Public Function getApplicationAck(ByVal AppAckID As Byte) As Integer
+    Public Function GetApplicationAck(ByVal AppAckID As Byte) As Integer
         ' Returns 0 = App Ack received, -1 = timeout, -2 Application Nak, -3 = Invalid message, -4 = wrong AppAckID
         Dim xmitBuffer(8) As Byte
         Dim pendingTime As System.DateTime
@@ -1547,10 +1571,10 @@ Public Class FrmMain
                 If deltaMS > 3000 Then   '3sec is default - tie to box on screen
                     'Timed out waiting for Application Ack/Nak
                     dispString = ByteToHexString(tempRxBuff, "Recv", tempRxPtr)    'Display the received data in the text box and log file
-                    sendToLog(dispString, "Error - Timed out waiting for Application Ack/Nak - 1")
+                    SendToLog(dispString, "Error - Timed out waiting for Application Ack/Nak - 1")
                     ReceivedText(dispString, "Error - Timed out waiting for Application Ack/Nak - 1")
-                    reset_state()
-                    getApplicationAck = -1
+                    Reset_state()
+                    GetApplicationAck = -1
                     Exit Do
                 End If
             Else
@@ -1561,46 +1585,49 @@ Public Class FrmMain
                         If receiveBuffer(5) = AppAckID Then
                             'This is the correct AppAckID
                             ReceivedText(dispString, "Recieved an Application Ack with code: " & Hex(receiveBuffer(5)))
-                            sendToLog(dispString, "Recieved an Application Ack with code: " & Hex(receiveBuffer(5)))
-                            getApplicationAck = 0
+                            SendToLog(dispString, "Recieved an Application Ack with code: " & Hex(receiveBuffer(5)))
+                            GetApplicationAck = 0
                             SendLinkAck()
                         Else
                             ReceivedText(dispString, "Recieved an Application Ack with wrong code: " & Hex(receiveBuffer(5)))
-                            sendToLog(dispString, "Recieved an Application Ack with wrong code: " & Hex(receiveBuffer(5)))
-                            getApplicationAck = -4
-                            sendLinkNak(2)
+                            SendToLog(dispString, "Recieved an Application Ack with wrong code: " & Hex(receiveBuffer(5)))
+                            GetApplicationAck = -4
+                            SendLinkNak(2)
                         End If
                     ElseIf receiveBuffer(0) = 8 And receiveBuffer(1) = 1 And receiveBuffer(2) = 0 And receiveBuffer(3) = 2 And receiveBuffer(4) = 4 Then 'This is an application Nak
                         Select Case receiveBuffer(5)
                             Case 0
                                 ReceivedText(dispString, "Application NAK returned with reason: 0 -No Reason Specified")
-                                sendToLog(dispString, "Application NAK returned with reason: 0 -No Reason Specified")
+                                SendToLog(dispString, "Application NAK returned with reason: 0 -No Reason Specified")
                             Case 1
                                 ReceivedText(dispString, "Application NAK returned with reason: 1 -Opcode 1 not supported")
-                                sendToLog(dispString, "Application NAK returned with reason: 1 -Opcode 1 not supported")
+                                SendToLog(dispString, "Application NAK returned with reason: 1 -Opcode 1 not supported")
                             Case 2
                                 ReceivedText(dispString, "Application NAK returned with reason: 2 -Opcode 2 invalid")
-                                sendToLog(dispString, "Application NAK returned with reason: 2 -Opcode 2 invalid")
+                                SendToLog(dispString, "Application NAK returned with reason: 2 -Opcode 2 invalid")
                             Case 3
                                 ReceivedText(dispString, "Application NAK returned with reason: 3 -Busy")
-                                sendToLog(dispString, "Application NAK returned with reason: 3 -Busy")
+                                SendToLog(dispString, "Application NAK returned with reason: 3 -Busy")
                             Case 4
                                 ReceivedText(dispString, "Application NAK returned with reason: 4 -Length Invalid")
-                                sendToLog(dispString, "Application NAK returned with reason: 4 -Length Invalid")
+                                SendToLog(dispString, "Application NAK returned with reason: 4 -Length Invalid")
+                            Case 5
+                                ReceivedText(dispString, "Application NAK returned with reason: 5 -Customer Override is in effect")
+                                SendToLog(dispString, "Application NAK returned with reason: 5 -Customer Override is in effect")
                         End Select
-                        getApplicationAck = -2
+                        GetApplicationAck = -2
                         SendLinkAck()
                     Else 'Invalid message received
                         ReceivedText(dispString, "Invalid message returned")
-                        sendToLog(dispString, "Invalid message returned")
-                        getApplicationAck = -3
-                        sendLinkNak(0)
+                        SendToLog(dispString, "Invalid message returned")
+                        GetApplicationAck = -3
+                        SendLinkNak(0)
                     End If
                 Else
-                    sendToLog(dispString, "Wrong size message received for application Ack")
+                    SendToLog(dispString, "Wrong size message received for application Ack")
                     ReceivedText(dispString, "Wrong size message received for application Ack")
-                    getApplicationAck = -3
-                    sendLinkNak(4)
+                    GetApplicationAck = -3
+                    SendLinkNak(4)
                 End If
                 Exit Do
             End If
@@ -1614,10 +1641,10 @@ Public Class FrmMain
         End If
         'End debug section
 
-        Return getApplicationAck
+        Return GetApplicationAck
     End Function
 
-    Public Function getStateQueryResp() As Integer
+    Public Function GetStateQueryResp() As Integer
         ' Returns state value or -1 for timeout or -2 for invalid message
         Dim xmitBuffer(8) As Byte
         Dim pendingTime As System.DateTime
@@ -1637,10 +1664,10 @@ Public Class FrmMain
                 If deltaMS > 3000 Then   '3sec is default - tie to box on screen
                     'Timed out waiting for State Query Response
                     dispString = ByteToHexString(tempRxBuff, "Recv", tempRxPtr)    'Display the received data in the text box and log file
-                    sendToLog(dispString, "Error - Timed out waiting for State Query Response")
+                    SendToLog(dispString, "Error - Timed out waiting for State Query Response")
                     ReceivedText(dispString, "Error - Timed out waiting for State Query Response")
-                    reset_state()
-                    getStateQueryResp = -1
+                    Reset_state()
+                    GetStateQueryResp = -1
                     Exit Do
                 End If
             Else
@@ -1648,79 +1675,85 @@ Public Class FrmMain
                 dispString = ByteToHexString(receiveBuffer, "Recv", receiveIndex)       'Display the received data in the text box and log file
                 If receiveIndex = 8 Then
                     If receiveBuffer(0) = 8 And receiveBuffer(1) = 1 And receiveBuffer(2) = 0 And receiveBuffer(3) = 2 And receiveBuffer(4) = &H13 Then 'This is a State Query Response
-                        getStateQueryResp = receiveBuffer(5)
-                        If receiveBuffer(5) = 0 Then
-                            ReceivedText(dispString, "SGD Operating State is Idle Normal")
-                            sendToLog(dispString, "SGD Operating State is Idle Normal")
-                            currentStatetb.Text = "Idle Normal"
-                        ElseIf receiveBuffer(5) = 1 Then
-                            ReceivedText(dispString, "SGD Operating State is Running Normal")
-                            sendToLog(dispString, "SGD Operating State is Running Normal")
-                            currentStatetb.Text = "Running Normal"
-                        ElseIf receiveBuffer(5) = 2 Then
-                            ReceivedText(dispString, "SGD Operating State is Running Curtailed Grid")
-                            sendToLog(dispString, "SGD Operating State is Running Curtailed Grid")
-                            currentStatetb.Text = "Running Curtailed Grid"
-                        ElseIf receiveBuffer(5) = 3 Then
-                            ReceivedText(dispString, "SGD Operating State is Running Heightened Grid")
-                            sendToLog(dispString, "SGD Operating State is Running Heightened Grid")
-                            currentStatetb.Text = "Running Heightened Grid"
-                        ElseIf receiveBuffer(5) = 4 Then
-                            ReceivedText(dispString, "SGD Operating State is Idle Grid")
-                            sendToLog(dispString, "SGD Operating State is Idle Grid")
-                            currentStatetb.Text = "Idle Grid"
-                        ElseIf receiveBuffer(5) = 5 Then
-                            ReceivedText(dispString, "SGD Operating State is SGD Error Condition")
-                            sendToLog(dispString, "SGD Operating State is SGD Error Condition")
-                            currentStatetb.Text = "SGD Error Condition"
-                        ElseIf receiveBuffer(5) = 6 Then
-                            ReceivedText(dispString, "SGD Operating State is SGD Idle Heightened")
-                            sendToLog(dispString, "SGD Operating State is SGD Idle Heightened")
-                            currentStatetb.Text = "SGD Idle Heightened"
-                        ElseIf receiveBuffer(5) = 7 Then
-                            ReceivedText(dispString, "SGD Operating State is SGD Cycling On")
-                            sendToLog(dispString, "SGD Operating State is SGD Cycling On")
-                            currentStatetb.Text = "SGD Cycling On"
-                        ElseIf receiveBuffer(5) = 8 Then
-                            ReceivedText(dispString, "SGD Operating State is SGD Cycling Off")
-                            sendToLog(dispString, "SGD Operating State is SGD Cycling Off")
-                            currentStatetb.Text = "SGD Cycling Off"
-                        ElseIf receiveBuffer(5) = 9 Then
-                            ReceivedText(dispString, "SGD Operating State is SGD Variable Following")
-                            sendToLog(dispString, "SGD Operating State is SGD Variable Following")
-                            currentStatetb.Text = "SGD Variable Following"
-                        ElseIf receiveBuffer(5) = 10 Then
-                            ReceivedText(dispString, "SGD Operating State is SGD Variable Not Following")
-                            sendToLog(dispString, "SGD Operating State is SGD Variable Not Following")
-                            currentStatetb.Text = "SGD Variable Not Following"
-                        ElseIf receiveBuffer(5) = 11 Then
-                            ReceivedText(dispString, "SGD Operating State is SGD Idle Opted Out")
-                            sendToLog(dispString, "SGD Operating State is SGD Idle Opted Out")
-                            currentStatetb.Text = "SGD Idle Opted Out"
-                        ElseIf receiveBuffer(5) = 12 Then
-                            ReceivedText(dispString, "SGD Operating State is SGD Running Opted Out")
-                            sendToLog(dispString, "SGD Operating State is SGD Running Opted Out")
-                            currentStatetb.Text = "SGD Running Opted Out"
-                        End If
+                        GetStateQueryResp = receiveBuffer(5)
+                        DetermineOpState(dispString)
                         SendLinkAck()
                     Else 'Invalid message received
                         ReceivedText(dispString, "Invalid message returned")
-                        sendToLog(dispString, "Invalid message returned")
-                        getStateQueryResp = -2
-                        sendLinkNak(2)
+                        SendToLog(dispString, "Invalid message returned")
+                        GetStateQueryResp = -2
+                        SendLinkNak(2)
                     End If
                 Else
-                    sendToLog(dispString, "Wrong size message received for state query")
+                    SendToLog(dispString, "Wrong size message received for state query")
                     ReceivedText(dispString, "Wrong size message received for state query")
-                    sendLinkNak(4)
+                    SendLinkNak(4)
                 End If
                 Exit Do
             End If
         Loop
         receiveIndex = 0 'Remove AppAck from buffer
-        Return getStateQueryResp
+        Return GetStateQueryResp
 
     End Function
+
+    Private Sub DetermineOpState(dispString)
+
+        If receiveBuffer(5) = 0 Then
+            ReceivedText(dispString, "SGD Operating State is Idle Normal")
+            SendToLog(dispString, "SGD Operating State is Idle Normal, Op State")
+            currentStatetb.Text = "Idle Normal"
+        ElseIf receiveBuffer(5) = 1 Then
+            ReceivedText(dispString, "SGD Operating State is Running Normal")
+            SendToLog(dispString, "SGD Operating State is Running Normal, Op State")
+            currentStatetb.Text = "Running Normal"
+        ElseIf receiveBuffer(5) = 2 Then
+            ReceivedText(dispString, "SGD Operating State is Running Curtailed Grid")
+            SendToLog(dispString, "SGD Operating State is Running Curtailed Grid, Op State")
+            currentStatetb.Text = "Running Curtailed Grid"
+        ElseIf receiveBuffer(5) = 3 Then
+            ReceivedText(dispString, "SGD Operating State is Running Heightened Grid")
+            SendToLog(dispString, "SGD Operating State is Running Heightened Grid, Op State")
+            currentStatetb.Text = "Running Heightened Grid"
+        ElseIf receiveBuffer(5) = 4 Then
+            ReceivedText(dispString, "SGD Operating State is Idle Grid")
+            SendToLog(dispString, "SGD Operating State is Idle Grid, Op State")
+            currentStatetb.Text = "Idle Grid"
+        ElseIf receiveBuffer(5) = 5 Then
+            ReceivedText(dispString, "SGD Operating State is SGD Error Condition")
+            SendToLog(dispString, "SGD Operating State is SGD Error Condition, Op State")
+            currentStatetb.Text = "SGD Error Condition"
+        ElseIf receiveBuffer(5) = 6 Then
+            ReceivedText(dispString, "SGD Operating State is SGD Idle Heightened")
+            SendToLog(dispString, "SGD Operating State is SGD Idle Heightened, Op State")
+            currentStatetb.Text = "SGD Idle Heightened"
+        ElseIf receiveBuffer(5) = 7 Then
+            ReceivedText(dispString, "SGD Operating State is SGD Cycling On")
+            SendToLog(dispString, "SGD Operating State is SGD Cycling On, Op State")
+            currentStatetb.Text = "SGD Cycling On"
+        ElseIf receiveBuffer(5) = 8 Then
+            ReceivedText(dispString, "SGD Operating State is SGD Cycling Off")
+            SendToLog(dispString, "SGD Operating State is SGD Cycling Off, Op State")
+            currentStatetb.Text = "SGD Cycling Off"
+        ElseIf receiveBuffer(5) = 9 Then
+            ReceivedText(dispString, "SGD Operating State is SGD Variable Following")
+            SendToLog(dispString, "SGD Operating State is SGD Variable Following, Op State")
+            currentStatetb.Text = "SGD Variable Following"
+        ElseIf receiveBuffer(5) = 10 Then
+            ReceivedText(dispString, "SGD Operating State is SGD Variable Not Following")
+            SendToLog(dispString, "SGD Operating State is SGD Variable Not Following, Op State")
+            currentStatetb.Text = "SGD Variable Not Following"
+        ElseIf receiveBuffer(5) = 11 Then
+            ReceivedText(dispString, "SGD Operating State is SGD Idle Opted Out")
+            SendToLog(dispString, "SGD Operating State is SGD Idle Opted Out, Op State")
+            currentStatetb.Text = "SGD Idle Opted Out"
+        ElseIf receiveBuffer(5) = 12 Then
+            ReceivedText(dispString, "SGD Operating State is SGD Running Opted Out")
+            SendToLog(dispString, "SGD Operating State is SGD Running Opted Out, Op State")
+            currentStatetb.Text = "SGD Running Opted Out"
+        End If
+
+    End Sub
 
     'Sends an Ack signal after delay
     Private Sub SendLinkAck()
@@ -1732,7 +1765,7 @@ Public Class FrmMain
         Else
             targetMS = tMAValBox.Value - 10
         End If
-        pauseMS(targetMS)       'Wait before sending Ack
+        PauseMS(targetMS)       'Wait before sending Ack
         expectingResponse = False
         If forceNak = True Then
             xmitBuffer(0) = &H15
@@ -1747,7 +1780,7 @@ Public Class FrmMain
     End Sub
 
     'Sends an Nak signal after delay
-    Private Sub sendLinkNak(errVal As Byte)
+    Private Sub SendLinkNak(errVal As Byte)
         Dim xmitBuffer(2) As Byte
         Dim targetMS As Integer
 
@@ -1756,7 +1789,7 @@ Public Class FrmMain
         Else
             targetMS = tMAValBox.Value - 10
         End If
-        pauseMS(targetMS)       'Wait before sending Nak
+        PauseMS(targetMS)       'Wait before sending Nak
         expectingResponse = False
         xmitBuffer(0) = &H15
         If forceNak = True Then
@@ -1766,11 +1799,11 @@ Public Class FrmMain
         End If
         pendingLinkAck = False  'Set the pendingLinkAck to nothing
         SendComData(xmitBuffer, 2, "", pendingLinkAck)
-        reset_state()
+        Reset_state()
 
     End Sub
 
-    Private Sub tmrTimeSync_Tick(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles tmrTimeSync.Tick
+    Private Sub TmrTimeSync_Tick(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles tmrTimeSync.Tick
         Dim xmitBuffer(8) As Byte
         Dim tempHour As Integer
         Dim tempDay As Integer
@@ -1807,7 +1840,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub hideUCMbroupBoxes()
+    Private Sub HideUCMbroupBoxes()
         Try
             ucmTabControl.Enabled = False
 
@@ -1816,7 +1849,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub chkBadCheckSum_CheckedChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles chkBadCheckSum.CheckedChanged
+    Private Sub ChkBadCheckSum_CheckedChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles chkBadCheckSum.CheckedChanged
         Try
             If chkBadCheckSum.Checked = True Then
                 wantBadSum = True
@@ -1828,7 +1861,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub chkLongMsg_CheckedChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles chkLongMsg.CheckedChanged
+    Private Sub ChkLongMsg_CheckedChanged(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles chkLongMsg.CheckedChanged
 
         If chkLongMsg.Checked = True Then
             useLongMsg = True
@@ -1851,7 +1884,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub tmrBaudDefault_Tick(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles tmrBaudDefault.Tick
+    Private Sub TmrBaudDefault_Tick(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles tmrBaudDefault.Tick
         Try
             CmbBaud.SelectedIndex = 0
             SerialPort1.Close()             'Close our Serial Port
@@ -1866,7 +1899,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub btnAcceptChangeBaud_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles btnAcceptChangeBaud.Click
+    Private Sub BtnAcceptChangeBaud_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles btnAcceptChangeBaud.Click
         Dim xmitBuffer(8) As Byte
 
         Try
@@ -1912,15 +1945,20 @@ Public Class FrmMain
 
     Private Sub Browse_Click(ByVal sender As System.Object, ByVal e As System.EventArgs) Handles Browse.Click
         Try
-            If SaveFileDialog1.ShowDialog() = DialogResult.OK Then
-                tbLogFile.Text = SaveFileDialog1.FileName
+            Dim LogFile = New SaveFileDialog With {
+                .DefaultExt = "csv",
+                .Filter = "comma delimited (*.csv)|*.csv|All files (*.*)|*.*",
+                .InitialDirectory = IO.Directory.GetCurrentDirectory()
+            }
+            If LogFile.ShowDialog() = DialogResult.OK Then
+                tbLogFile.Text = LogFile.FileName
             End If
         Catch ex As Exception
             MessageBox.Show("Error occured in Sub Browse_Click: " & ex.Message)
         End Try
     End Sub
 
-    Private Sub addSupportedType_Click(sender As Object, e As EventArgs) Handles addSupportedType.Click
+    Private Sub AddSupportedType_Click(sender As Object, e As EventArgs) Handles addSupportedType.Click
         Dim msgTypeAsString As String
 
         Try
@@ -1943,7 +1981,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub removeSupportedType_Click(sender As Object, e As EventArgs) Handles removeSupportedType.Click
+    Private Sub RemoveSupportedType_Click(sender As Object, e As EventArgs) Handles removeSupportedType.Click
         Try
             supportedMsgTypeList.Items.Remove(supportedMsgTypeList.SelectedItem)
         Catch ex As Exception
@@ -1951,7 +1989,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub typeSupportedQueryCodeLookup_Click(sender As Object, e As EventArgs) Handles typeSupportedQueryCodeLookup.Click
+    Private Sub TypeSupportedQueryCodeLookup_Click(sender As Object, e As EventArgs) Handles typeSupportedQueryCodeLookup.Click
         Try
             MsgBox("Below are listed several predefined message types:" & Environment.NewLine &
                            "" & Environment.NewLine &
@@ -1964,15 +2002,21 @@ Public Class FrmMain
                            "09 04: Smart Energy Profile 2.0 over IP Pass Through" & Environment.NewLine &
                            "09 05: OpenADR 1.0 over IP Pass Through" & Environment.NewLine &
                            "09 06: OpenADR 2.0 over IP Pass Through" & Environment.NewLine &
-                           "09 07: Generic IP Pass Through")
+                           "09 07: Generic IP Pass Through" & Environment.NewLine &
+                           "09 08: ECHONET Lite Pass Through" & Environment.NewLine &
+                           "09 09: KNX Through" & Environment.NewLine &
+                           "09 0A: Lon Talk Pass Through" & Environment.NewLine &
+                           "09 0B: SunSpec Pass Through" & Environment.NewLine &
+                           "09 0C: BACnet Pass Through")
         Catch ex As Exception
             MessageBox.Show("Error occured in Sub typeSupportedQueryCodeLookup_Click: " & ex.Message)
         End Try
     End Sub
 
-    Private Sub disableLogFile_CheckedChanged(sender As Object, e As EventArgs) Handles disableLogFile.CheckedChanged
+    Private Sub DisableLogFile_CheckedChanged(sender As Object, e As EventArgs) Handles disableLogFile.CheckedChanged
         Try
             If disableLogFile.Checked = True Then
+                ' TODO : Add a flag to enable writing memory for Generating report
                 tbLogFile.Enabled = False
                 Browse.Enabled = False
                 cbVerboseLog.Enabled = False
@@ -1986,35 +2030,35 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub presentPriceTrackBar_Scroll(sender As Object, e As EventArgs) Handles presentPriceTrackBar.Scroll
+    Private Sub PresentPriceTrackBar_Scroll(sender As Object, e As EventArgs) Handles presentPriceTrackBar.Scroll
         Try
             If presentPriceTrackBar.Value = 0 Then
                 presentPriceTextBox.Text = "Unknown"
             ElseIf presentPriceTrackBar.Value = &HFF Then
                 presentPriceTextBox.Text = ("Maximum")
             Else
-                presentPriceTextBox.Text = byteToRelativePrice(presentPriceTrackBar.Value)
+                presentPriceTextBox.Text = ByteToRelativePrice(presentPriceTrackBar.Value)
             End If
         Catch ex As Exception
             MessageBox.Show("Error occured in Sub presentPriceTrackBar_Scroll: " & ex.Message)
         End Try
     End Sub
 
-    Private Sub nextPeriodTrackBar_Scroll(sender As Object, e As EventArgs) Handles nextPeriodTrackBar.Scroll
+    Private Sub NextPeriodTrackBar_Scroll(sender As Object, e As EventArgs) Handles nextPeriodTrackBar.Scroll
         Try
             If nextPeriodTrackBar.Value = 0 Then
                 nextPeriodPriceTextBox.Text = "Unknown"
             ElseIf nextPeriodTrackBar.Value = &HFF Then
                 nextPeriodPriceTextBox.Text = ("Maximum")
             Else
-                nextPeriodPriceTextBox.Text = byteToRelativePrice(nextPeriodTrackBar.Value)
+                nextPeriodPriceTextBox.Text = ByteToRelativePrice(nextPeriodTrackBar.Value)
             End If
         Catch ex As Exception
             MessageBox.Show("Error occured in Sub nextPeriodTrackBar_Scroll: " & ex.Message)
         End Try
     End Sub
 
-    Private Sub timeRemainingTrackBar_Scroll(sender As Object, e As EventArgs) Handles timeRemainingTrackBar.Scroll
+    Private Sub TimeRemainingTrackBar_Scroll(sender As Object, e As EventArgs) Handles timeRemainingTrackBar.Scroll
         Dim duration As Long
         Dim durHours As Byte
         Dim durMin As Byte
@@ -2033,7 +2077,7 @@ Public Class FrmMain
         End If
     End Sub
 
-    Private Sub queryDeviceInfoButton_Click(sender As Object, e As EventArgs) Handles queryDeviceInfoButton.Click
+    Private Sub QueryDeviceInfoButton_Click(sender As Object, e As EventArgs) Handles queryDeviceInfoButton.Click
         Dim xmitBuffer(8) As Byte
 
         Try
@@ -2042,7 +2086,7 @@ Public Class FrmMain
             otherDeviceDeviceRevision.Text = ""
             otherDeviceCapabilityBitmap.Text = ""
             otherDeviceSerialNumber.Text = ""
-            otherDeviceCEA2045Version.Text = ""
+            otherDeviceCTA2045Version.Text = ""
             otherDeviceModelNumber.Text = ""
             otherDeviceFirmwareDate.Text = ""
             otherDeviceFirmwareMajor.Text = ""
@@ -2063,7 +2107,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub populateDeviceInfo(mode As Integer)
+    Private Sub PopulateDeviceInfo(mode As Integer)
         'Populates the Device Type drop down box with appropriate values
         Try
             If mode = 0 Then    'This device is a UCM
@@ -2129,11 +2173,14 @@ Public Class FrmMain
                 deviceTypeComboBox.Items.Add("In Premises Display")
                 deviceTypeComboBox.Items.Add("Energy Manager")
                 deviceTypeComboBox.Items.Add("Gateway Device")
+                deviceTypeComboBox.Items.Add("Distributed Energy Resources")
+                deviceTypeComboBox.Items.Add("Solar Inverter")
+                deviceTypeComboBox.Items.Add("Battery Storage")
                 deviceTypeComboBox.Items.Add("Other")
             End If
 
             'Add Generic Values to Form for ease of debugging
-            populateGenericDeviceInfo()
+            PopulateGenericDeviceInfo()
 
         Catch ex As Exception
             MessageBox.Show("Error occured in Sub populateDeviceInfo: " & ex.Message)
@@ -2141,7 +2188,7 @@ Public Class FrmMain
     End Sub
 
     'Populates Device Info fields with generic values for testing/debugging
-    Private Sub populateGenericDeviceInfo()
+    Private Sub PopulateGenericDeviceInfo()
 
         nudVendorIDLSB.Value = &H55
         nudVendorIDMSB.Value = &H44
@@ -2160,7 +2207,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub deviceTypeComboBox_SelectedIndexChanged(sender As Object, e As EventArgs) Handles deviceTypeComboBox.SelectedIndexChanged
+    Private Sub DeviceTypeComboBox_SelectedIndexChanged(sender As Object, e As EventArgs) Handles deviceTypeComboBox.SelectedIndexChanged
         Try
             deviceTypeLSBTextBox.Enabled = False
             deviceTypeMSBTextBox.Enabled = False
@@ -2348,6 +2395,15 @@ Public Class FrmMain
                     Case "Gateway Device"
                         deviceTypeMSBTextBox.Text = "60"
                         deviceTypeLSBTextBox.Text = "0"
+                    Case "Distributed Energy Resources"
+                        deviceTypeMSBTextBox.Text = "70"
+                        deviceTypeLSBTextBox.Text = "0"
+                    Case "Solar Inverter"
+                        deviceTypeMSBTextBox.Text = "70"
+                        deviceTypeLSBTextBox.Text = "1"
+                    Case "Battery Storage"
+                        deviceTypeMSBTextBox.Text = "70"
+                        deviceTypeLSBTextBox.Text = "2"
                     Case "Other"
                         deviceTypeMSBTextBox.Text = ""
                         deviceTypeLSBTextBox.Text = ""
@@ -2362,7 +2418,7 @@ Public Class FrmMain
     End Sub
 
     'Allows access to dates depending on the month and year
-    Private Sub firmwareMonthComboBox_SelectedIndexChanged(sender As Object, e As EventArgs) Handles firmwareMonthComboBox.SelectedIndexChanged
+    Private Sub FirmwareMonthComboBox_SelectedIndexChanged(sender As Object, e As EventArgs) Handles firmwareMonthComboBox.SelectedIndexChanged
         Try
             If firmwareMonthComboBox.SelectedItem = "September" Or firmwareMonthComboBox.SelectedItem = "April" Or firmwareMonthComboBox.SelectedItem = "June" Or firmwareMonthComboBox.SelectedItem = "November" Then
                 firmwareDayComboBox.Items.Remove("31")
@@ -2385,7 +2441,7 @@ Public Class FrmMain
     End Sub
 
     'Provides an easy marker for determing if the device supports the feature
-    Private Sub modelNumberSupportedCheckbox_CheckedChanged(sender As Object, e As EventArgs) Handles modelNumberSupportedCheckbox.CheckedChanged
+    Private Sub ModelNumberSupportedCheckbox_CheckedChanged(sender As Object, e As EventArgs) Handles modelNumberSupportedCheckbox.CheckedChanged
         Try
             If modelNumberSupportedCheckbox.Checked = True Then
                 modelNumberTextBox.Enabled = True
@@ -2399,7 +2455,7 @@ Public Class FrmMain
     End Sub
 
     'Provides an easy marker for determing if the device supports the feature
-    Private Sub serialNumberSupportedCheckbox_CheckedChanged(sender As Object, e As EventArgs) Handles serialNumberSupportedCheckbox.CheckedChanged
+    Private Sub SerialNumberSupportedCheckbox_CheckedChanged(sender As Object, e As EventArgs) Handles serialNumberSupportedCheckbox.CheckedChanged
         Try
             If serialNumberSupportedCheckbox.Checked = True Then
                 serialNumberTextBox.Enabled = True
@@ -2413,7 +2469,7 @@ Public Class FrmMain
     End Sub
 
     'Compiles and then sends a GetInfo Reply
-    Private Sub sendDeviceData()
+    Private Sub SendDeviceData()
         Dim xmitBuffer(59) As Byte
         Dim problem As Byte
         Dim tmpstring As String
@@ -2439,11 +2495,7 @@ Public Class FrmMain
             Else
                 xmitBuffer(7) = &H20       'Set value to space
             End If
-            If StringLen > 1 Then
-                xmitBuffer(8) = array1(1)
-            Else
-                xmitBuffer(8) = &H20       'Set value to space
-            End If
+            xmitBuffer(8) = &H0            'Set value null
 
             'VendorID
             xmitBuffer(9) = nudVendorIDMSB.Value
@@ -2525,7 +2577,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub interpreteDeviceInfoReply(ByRef buffer() As Byte, length As Integer)
+    Private Sub InterpreteDeviceInfoReply(ByRef buffer() As Byte, length As Integer)
         Dim tmpstring As String
         Dim tmpArray(16) As Byte
         Dim i As Integer
@@ -2536,7 +2588,12 @@ Public Class FrmMain
                 ReceivedText("", "There was an error with the other device - " & buffer(6))
             Else
                 'Gets CTA-2045 Version
-                otherDeviceCEA2045Version.Text = Chr(buffer(7)) & Chr(buffer(8))
+                If buffer(8) = 0 Then
+                    otherDeviceCTA2045Version.Text = Chr(buffer(7))
+                    'otherDeviceCTA2045Version.Text = Chr(buffer(7)) & Chr(buffer(8))
+                Else
+                    otherDeviceCTA2045Version.Text = "Invalid"
+                End If
 
                 'Gets VendorID
                 otherDeviceVendorID.Text = buffer(9).ToString("X") & " " & buffer(10).ToString("X")
@@ -2737,21 +2794,21 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub rbMaxPayload1_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload1.CheckedChanged
+    Private Sub RbMaxPayload1_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload1.CheckedChanged
         If rbMaxPayload1.Checked Then
             MaxPayloadSize = 2
             MaxPayload = 0
         End If
     End Sub
 
-    Private Sub rbMaxPayload2_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload2.CheckedChanged
+    Private Sub RbMaxPayload2_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload2.CheckedChanged
         If rbMaxPayload2.Checked Then
             MaxPayloadSize = 4
             MaxPayload = 1
         End If
     End Sub
 
-    Private Sub rbMaxPayload3_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload3.CheckedChanged
+    Private Sub RbMaxPayload3_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload3.CheckedChanged
         If rbMaxPayload3.Checked Then
             MaxPayloadSize = 8
             MaxPayload = 2
@@ -2759,77 +2816,77 @@ Public Class FrmMain
     End Sub
 
 
-    Private Sub rbMaxPayload4_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload4.CheckedChanged
+    Private Sub RbMaxPayload4_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload4.CheckedChanged
         If rbMaxPayload4.Checked Then
             MaxPayloadSize = 16
             MaxPayload = 3
         End If
     End Sub
 
-    Private Sub rbMaxPayload5_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload5.CheckedChanged
+    Private Sub RbMaxPayload5_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload5.CheckedChanged
         If rbMaxPayload5.Checked Then
             MaxPayloadSize = 32
             MaxPayload = 4
         End If
     End Sub
 
-    Private Sub rbMaxPayload6_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload6.CheckedChanged
+    Private Sub RbMaxPayload6_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload6.CheckedChanged
         If rbMaxPayload6.Checked Then
             MaxPayloadSize = 64
             MaxPayload = 5
         End If
     End Sub
 
-    Private Sub rbMaxPayload7_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload7.CheckedChanged
+    Private Sub RbMaxPayload7_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload7.CheckedChanged
         If rbMaxPayload7.Checked Then
             MaxPayloadSize = 128
             MaxPayload = 6
         End If
     End Sub
 
-    Private Sub rbMaxPayload8_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload8.CheckedChanged
+    Private Sub RbMaxPayload8_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload8.CheckedChanged
         If rbMaxPayload8.Checked Then
             MaxPayloadSize = 256
             MaxPayload = 7
         End If
     End Sub
 
-    Private Sub rbMaxPayload9_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload9.CheckedChanged
+    Private Sub RbMaxPayload9_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload9.CheckedChanged
         If rbMaxPayload9.Checked Then
             MaxPayloadSize = 512
             MaxPayload = 8
         End If
     End Sub
 
-    Private Sub rbMaxPayload10_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload10.CheckedChanged
+    Private Sub RbMaxPayload10_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload10.CheckedChanged
         If rbMaxPayload10.Checked Then
             MaxPayloadSize = 1024
             MaxPayload = 9
         End If
     End Sub
 
-    Private Sub rbMaxPayload11_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload11.CheckedChanged
+    Private Sub RbMaxPayload11_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload11.CheckedChanged
         If rbMaxPayload11.Checked Then
             MaxPayloadSize = 1280
             MaxPayload = 10
         End If
     End Sub
 
-    Private Sub rbMaxPayload12_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload12.CheckedChanged
+    Private Sub RbMaxPayload12_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload12.CheckedChanged
         If rbMaxPayload12.Checked Then
             MaxPayloadSize = 1500
             MaxPayload = 11
         End If
     End Sub
 
-    Private Sub rbMaxPayload13_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload13.CheckedChanged
+    Private Sub RbMaxPayload13_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload13.CheckedChanged
         If rbMaxPayload13.Checked Then
             MaxPayloadSize = 2048
             MaxPayload = 12
         End If
     End Sub
 
-    Private Sub rbMaxPayload14_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload14.CheckedChanged
+    Private Sub RbMaxPayload14_CheckedChanged(sender As Object, e As EventArgs) Handles rbMaxPayload14.CheckedChanged
         If rbMaxPayload14.Checked Then
             MaxPayloadSize = 4096
             MaxPayload = 13
@@ -2847,7 +2904,7 @@ Public Class FrmMain
     End Function
 
 
-    Private Sub btnGetUTC_Click(sender As Object, e As EventArgs) Handles btnGetUTC.Click
+    Private Sub BtnGetUTC_Click(sender As Object, e As EventArgs) Handles btnGetUTC.Click
         Dim xmitBuffer(8) As Byte
 
         Try
@@ -2867,7 +2924,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub reset_state()
+    Private Sub Reset_state()
         receiveIndex = 0
         pendingAck = 0
         tempRxPtr = 0
@@ -2882,7 +2939,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub tmrProcessComm_Tick(sender As Object, e As EventArgs) Handles tmrProcessComm.Tick
+    Private Sub TmrProcessComm_Tick(sender As Object, e As EventArgs) Handles tmrProcessComm.Tick
         Dim dispString As String
         Dim xmitBuffer(8) As Byte
         Dim LinkNackError As Byte
@@ -2900,7 +2957,7 @@ Public Class FrmMain
 
         'Triggers the next script checking section
         If DateTime.Now >= nextScriptTestTime And nextScriptTestTime > New DateTime(1970, 1, 1) Then
-            testScriptFile(scriptFileReader)        'Evaluate next script command
+            TestScriptFile(scriptFileReader)        'Evaluate next script command
         End If
 
         'Check to see if a message being received has timed out
@@ -2913,9 +2970,9 @@ Public Class FrmMain
                 'Message has timed out
                 'It has been over 500ms (default) since the start of the message so ignore existing data
                 dispString = ByteToHexString(tempRxBuff, "Recv", tempRxPtr)    'Display the received data in the text box and log file
-                sendToLog(dispString, "Error - Timed out waiting for data")
+                SendToLog(dispString, "Error - Timed out waiting for data")
                 ReceivedText(dispString, "Error - Timed out waiting for data")
-                reset_state()
+                Reset_state()
             End If
         End If
 
@@ -2930,25 +2987,25 @@ Public Class FrmMain
                 If deltaMS > 200 Then       'tMA
                     'Timed out waiting for a link ack/nak - 200ms is max time to wait
                     dispString = ByteToHexString(tempRxBuff, "Recv", tempRxPtr)    'Display the received data in the text box
-                    sendToLog(dispString, "Error - timed out waiting for Link Ack/Nak-1")
+                    SendToLog(dispString, "Error - timed out waiting for Link Ack/Nak-1")
                     ReceivedText(dispString, "Error - timed out waiting for Link Ack/Nak-1")
-                    reset_state()
+                    Reset_state()
                 End If
             ElseIf pendingAck <> 0 Then
                 If deltaMS > 3000 Then      'tAR
                     'Timed out waiting for an application ack/nak - application defined max time to wait - Use 3 seconds
                     dispString = ByteToHexString(tempRxBuff, "Recv", tempRxPtr)    'Display the received data in the text box
-                    sendToLog(dispString, "Error - timed out waiting for Application Ack/Nak-2")
+                    SendToLog(dispString, "Error - timed out waiting for Application Ack/Nak-2")
                     ReceivedText(dispString, "Error - timed out waiting for Application Ack/Nak-2")
-                    reset_state()
+                    Reset_state()
                 End If
             ElseIf expectingResponse = True Then
                 If deltaMS > 3000 Then      'tAR
                     'Timed out waiting for a response to a query
                     dispString = ByteToHexString(tempRxBuff, "Recv", tempRxPtr)    'Display the received data in the text box
-                    sendToLog(dispString, "Error - timed out waiting for query response")
+                    SendToLog(dispString, "Error - timed out waiting for query response")
                     ReceivedText(dispString, "Error - timed out waiting for query response")
-                    reset_state()
+                    Reset_state()
                 End If
             End If
 
@@ -2959,29 +3016,29 @@ Public Class FrmMain
         If rxMsgOverflow = True Then
             'More data than can fit in the receive buffer has arrived - probably junk so print and ignore
             dispString = ByteToHexString(tempRxBuff, "Recieved Message Larger than receive buffer", tempRxPtr)    'Display the received data in the text box
-            sendToLog(dispString, " Ignoring message.")
+            SendToLog(dispString, " Ignoring message.")
             ReceivedText(dispString, " Ignoring message.")
-            reset_state()
+            Reset_state()
         End If
 
         If receiveIndex > 0 Then
             If (rxMsgOversize = True) And (cbResponseSim.Checked = True) Then
                 dispString = ByteToHexString(receiveBuffer, "Recieved Message Larger than max payload:", receiveIndex)    'Display the received data in the text box
-                sendToLog(dispString, "Nak message as too large")
+                SendToLog(dispString, "Nak message as too large")
                 ReceivedText(dispString, "Nak message as too large")
                 rxMsgOversize = False
-                sendLinkNak(2)
-                reset_state()
+                SendLinkNak(2)
+                Reset_state()
             Else
                 If rxMsgOversize = True Then
                     dispString = "Recieved Message Larger than max payload"    'Warn operator that the message was too big but process anyway
-                    sendToLog(dispString, "Ignoring limit and processing message.")
+                    SendToLog(dispString, "Ignoring limit and processing message.")
                     ReceivedText(dispString, "Ignoring limit and processing message.")
                 End If
                 dispString = ByteToHexString(receiveBuffer, "Recv", receiveIndex)
                 If pendingLinkAck = True And receiveIndex >= 2 Then
                     If receiveBuffer(0) = 6 And receiveBuffer(1) = 0 Then 'This is a link Ack
-                        sendToLog(dispString, "Link Ack Received")
+                        SendToLog(dispString, "Link Ack Received")
                         ReceivedText(dispString, "Link Ack Received")
                         numCommandsResent = 0
                         pendingLinkAck = False  'Clear the pendingLinkAck flag
@@ -3004,7 +3061,7 @@ Public Class FrmMain
                         If overRideSet = True And sendOverridePend = True And rbMode1.Checked = False Then
                             'The customer override is set and a message is required in response last transmission
                             sendOverridePend = False
-                            pauseMS(tARValBox.Value)      'Wait before sending response
+                            PauseMS(tARValBox.Value)      'Wait before sending response
                             receiveIndex = 0
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 1
@@ -3020,31 +3077,31 @@ Public Class FrmMain
                     ElseIf receiveBuffer(0) = &H15 And receiveIndex >= 2 Then 'This is a link Nack
                         Select Case receiveBuffer(1)
                             Case 0
-                                sendToLog(dispString, "Link Nak Received: 0x0 No Reason Given")
+                                SendToLog(dispString, "Link Nak Received: 0x0 No Reason Given")
                                 ReceivedText(dispString, "Link Nak Received: 0x0 No Reason Given")
                             Case 1  'This case should never occur. Simulator has no way of catching this error
-                                sendToLog(dispString, "Link Nak Received: 0x1 Invalid Byte")
+                                SendToLog(dispString, "Link Nak Received: 0x1 Invalid Byte")
                                 ReceivedText(dispString, "Link Nak Received: 0x1 Invalid Byte")
                             Case 2
-                                sendToLog(dispString, "Link Nak Received: 0x2 Invalid Length")
+                                SendToLog(dispString, "Link Nak Received: 0x2 Invalid Length")
                                 ReceivedText(dispString, "Link Nak Received: 0x2 Invalid Length")
                             Case 3
-                                sendToLog(dispString, "Link Nak Received: 0x3 Checksum Error")
+                                SendToLog(dispString, "Link Nak Received: 0x3 Checksum Error")
                                 ReceivedText(dispString, "Link Nak Received: 0x3 Checksum Error")
                             Case 4
-                                sendToLog(dispString, "Link Nak Received: 0x4 Reserved")
+                                SendToLog(dispString, "Link Nak Received: 0x4 Reserved")
                                 ReceivedText(dispString, "Link Nak Received: 0x4 Reserved")
                             Case 5
-                                sendToLog(dispString, "Link Nak Received: 0x5 Message Timeout")
+                                SendToLog(dispString, "Link Nak Received: 0x5 Message Timeout")
                                 ReceivedText(dispString, "Link Nak Received: 0x5 Message Timeout")
                             Case 6
-                                sendToLog(dispString, "Link Nak Received: 0x6 Unsupported Message Type")
+                                SendToLog(dispString, "Link Nak Received: 0x6 Unsupported Message Type")
                                 ReceivedText(dispString, "Link Nak Received: 0x6 Unsupported Message Type")
                             Case 7
-                                sendToLog(dispString, "Link Nak Received: 0x7 Request Not Supported")
+                                SendToLog(dispString, "Link Nak Received: 0x7 Request Not Supported")
                                 ReceivedText(dispString, "Link Nak Received: 0x7 Request Not Supported")
                             Case Else
-                                sendToLog(dispString, "Unknown Link Nak Received: " & Conversion.Hex(receiveBuffer(1)))
+                                SendToLog(dispString, "Unknown Link Nak Received: " & Conversion.Hex(receiveBuffer(1)))
                                 ReceivedText(dispString, "Unknown Link Nak Received :" & Conversion.Hex(receiveBuffer(1)))
                         End Select
                         pendingLinkAck = False  'Clear the pendingLinkAck flag
@@ -3058,8 +3115,8 @@ Public Class FrmMain
                     Else
                         'We are expecting a link Ack or Nak but this is neither
                         'Remove the pendingLinkAck flag and write error to log file
-                        reset_state()
-                        sendToLog("", "Error - Expected link Ack/Nak not received")
+                        Reset_state()
+                        SendToLog("", "Error - Expected link Ack/Nak not received")
                         ReceivedText("", "Error - Expected link Ack/Nak not received")
                     End If
 
@@ -3077,9 +3134,9 @@ Public Class FrmMain
                         End If
                     Next i
                     'Display the received data in the text box
-                    sendToLog(dispString, "Received message type supported query")
+                    SendToLog(dispString, "Received message type supported query")
                     ReceivedText(dispString, "Received message type supported query")
-                    processTypeSupportedQuery()
+                    ProcessTypeSupportedQuery()
                     RefreshODMsgList()
 
                 ElseIf receiveBuffer(0) = 8 And (receiveBuffer(1) = 1 Or receiveBuffer(1) = 2 Or receiveBuffer(1) = 3) Then
@@ -3087,13 +3144,13 @@ Public Class FrmMain
                     If receiveBuffer(1) = 1 Then
                         'Basic message - Check that the message is the correct length
                         If receiveIndex = 8 Then
-                            processBasicDRAppMsg(dispString)
+                            ProcessBasicDRAppMsg(dispString)
                         Else
                             'Wrong length for 0x8 0x1 message
                             dispString = ByteToHexString(receiveBuffer, "Recv", receiveIndex)
-                            sendToLog(dispString, "Error - Message was the wrong length")
+                            SendToLog(dispString, "Error - Message was the wrong length")
                             ReceivedText(dispString, "Error - Message was the wrong length")
-                            sendLinkNak(2)
+                            SendLinkNak(2)
                         End If
 
                     Else
@@ -3102,32 +3159,32 @@ Public Class FrmMain
                             If receiveBuffer(1) = 2 Then
                                 ProcessIntDRAppMsg(dispString)
                             Else
-                                processDataLinkMsg(dispString)
+                                ProcessDataLinkMsg(dispString)
                             End If
                         Else
                             'Wrong length for 0x8 0x1 message
                             dispString = ByteToHexString(receiveBuffer, "Recv", receiveIndex)
-                            sendToLog(dispString, "Error - Message was the wrong length")
+                            SendToLog(dispString, "Error - Message was the wrong length")
                             ReceivedText(dispString, "Error - Message was the wrong length")
-                            sendLinkNak(2)
+                            SendLinkNak(2)
                         End If
                     End If
 
                 ElseIf receiveBuffer(0) = 9 Then
                     'This is a pass through message
                     dispString = ByteToHexString(receiveBuffer, "Recv", receiveIndex)   'Display the received data in the text box
-                    If verifyChecksum(receiveBuffer, (receiveIndex - 2)) = False Then
-                        sendToLog(dispString, "Received Invalid Checksum")
+                    If VerifyChecksum(receiveBuffer, (receiveIndex - 2)) = False Then
+                        SendToLog(dispString, "Received Invalid Checksum")
                         ReceivedText(dispString, "Received Invalid Checksum")
-                        sendLinkNak(3)
+                        SendLinkNak(3)
                     Else        'Checksum is valid so see what the message is
-                        sendToLog(dispString, "Pass through message received")
+                        SendToLog(dispString, "Pass through message received")
                         ReceivedText(dispString, "Pass through message received")
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                             pendingAck = 0  'Set the pendingAck to nothing
                             pendingLinkAck = False  'Set the pendingLinkAck to true
                         End If
@@ -3135,15 +3192,15 @@ Public Class FrmMain
                 Else
                     If receiveBuffer(0) = &H15 Or receiveBuffer(0) = &H6 Then 'This is a link Ack
                         'Received unexpected link ack or nak. Do not respond.
-                        sendToLog(dispString, "Received unexpected link ack or nak")
+                        SendToLog(dispString, "Received unexpected link ack or nak")
                         ReceivedText(dispString, "Received unexpected link ack or nak")
                     Else
                         'This message did not match any of the above types
-                        sendToLog(dispString, "Error - Message did not match any known type")
+                        SendToLog(dispString, "Error - Message did not match any known type")
                         ReceivedText(dispString, "Error - Message did not match any known type")
-                        sendLinkNak(6)
+                        SendLinkNak(6)
                     End If
-                    reset_state()
+                    Reset_state()
                 End If
                 receiveIndex = 0
             End If
@@ -3160,7 +3217,7 @@ Public Class FrmMain
         tmrProcessComm.Enabled = True
     End Sub
 
-    Private Sub sendMsgNotSupportedNak()
+    Private Sub SendMsgNotSupportedNak()
         Dim xmitBuffer(8) As Byte
 
         xmitBuffer(0) = 8
@@ -3174,11 +3231,20 @@ Public Class FrmMain
 
     End Sub
 
+    Public Shared Function UnixTimeStampToDateTime(unixTimeStamp As Integer) As DateTime
+        'Public Shared Function UnixTimeStampToDateTime(unixTimeStamp As Double) As DateTime
+
+        ' Unix timestamp is seconds past epoch
+        Dim dtDateTime As System.DateTime = New DateTime(1970, 1, 1, 0, 0, 0, 0, System.DateTimeKind.Utc)
+        dtDateTime = dtDateTime.AddSeconds(unixTimeStamp).ToLocalTime()
+        Return dtDateTime
+    End Function
+
     Private Sub ProcessIntDRAppMsg(ByVal dispString As String)
 
         Dim UTCseconds As Integer
         Dim uTime As Integer
-        Dim xmitBuffer(61) As Byte
+        Dim xmitBuffer(121) As Byte
         Dim tmparr(8) As Byte
         Dim i, j As Integer
         Dim indexVal As Integer
@@ -3186,18 +3252,20 @@ Public Class FrmMain
         Dim tempLong2 As ULong
         Dim tempLong3 As ULong
         Dim tempint As Integer
+        Dim startDate As New DateTime(1970, 1, 1, 0, 0, 0)
+        Dim tempDate As New DateTime(1970, 1, 1, 0, 0, 0)
 
-        If verifyChecksum(receiveBuffer, (receiveIndex - 2)) = False Then
-            sendToLog(dispString, "Invalid Checksum Received")
+        If VerifyChecksum(receiveBuffer, (receiveIndex - 2)) = False Then
+            SendToLog(dispString, "Invalid Checksum Received")
             ReceivedText(dispString, "Invalid Checksum Received")
-            sendLinkNak(3)
+            SendLinkNak(3)
         Else
 
             Select Case receiveBuffer(4)
                 Case 1      'device info
                     If receiveBuffer(5) = 1 Then        'receiveBuffer(2) = 0 And receiveBuffer(3) = 2
                         'This is a device info request
-                        sendToLog(dispString, "Received a Device Info Request")
+                        SendToLog(dispString, "Received a Device Info Request")
                         ReceivedText(dispString, "Received a Device Info Request")
                         'Delete last message from buffer
                         receiveIndex = 0
@@ -3206,28 +3274,33 @@ Public Class FrmMain
                         receiveIndex = 0
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
 
                             If MaxPayloadSize >= 59 Then
-                                sendDeviceData()
+                                SendDeviceData()
                             Else
-                                sendMsgNotSupportedNak() 'Reply would be larger than max payload
+                                SendMsgNotSupportedNak() 'Reply would be larger than max payload
                                 ReceivedText("", "Tried to send a message longer than max payload")
                             End If
                         End If
 
                     ElseIf receiveBuffer(5) = &H81 Then         'receiveBuffer(2) = 0 And receiveBuffer(3) = &H33
                         'This is a device info request reply
-                        sendToLog(dispString, "Received Device Info")
+                        SendToLog(dispString, "Received Device Info")
                         ReceivedText(dispString, "Received Device Info")
                         SendLinkAck()
+                        If receiveBuffer(6) < 8 Then
+                            cbInterRespCodeRecv.SelectedIndex = receiveBuffer(6)
+                        Else
+                            cbInterRespCodeRecv.SelectedIndex = 8
+                        End If
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             If receiveBuffer(6) = 0 Then
-                                interpreteDeviceInfoReply(receiveBuffer, receiveBuffer(3) + 6)
+                                InterpreteDeviceInfoReply(receiveBuffer, receiveBuffer(3) + 6)
                             Else
                                 ReceivedText("", "There was an error with the device info request - " & receiveBuffer(6))
                             End If
@@ -3243,20 +3316,34 @@ Public Class FrmMain
                             'SGD has requested UTC time
                             uTime = (DateTime.UtcNow - New DateTime(1970, 1, 1, 0, 0, 0)).TotalSeconds
                             uTime -= 946684800      'Conver Unix time to seconds since 1/1/2000
-                            sendToLog(dispString, "Received a UTC time request. Time = " & uTime)
+                            SendToLog(dispString, "Received a UTC time request. Time = " & uTime)
                             ReceivedText(dispString, "Received a UTC time request. Time = " & uTime)
                             SendLinkAck()
                             If forceNak = True Then
-                                reset_state()
+                                Reset_state()
                             Else
-                                pauseMS(tARValBox.Value)      'Wait before sending response
+                                PauseMS(tARValBox.Value)      'Wait before sending response
                                 xmitBuffer(0) = 8
                                 xmitBuffer(1) = 2
                                 xmitBuffer(2) = 0
                                 xmitBuffer(3) = 9
                                 xmitBuffer(4) = 2
                                 xmitBuffer(5) = &H80
-                                xmitBuffer(6) = 0
+                                If rbMode1.Checked = True Then
+                                    'This is a UCM
+                                    If cbInterRespCode.SelectedIndex = 7 Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                Else
+                                    'This is an SGD
+                                    If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                End If
                                 xmitBuffer(10) = uTime And &HFF
                                 xmitBuffer(9) = (uTime >> 8) And &HFF
                                 xmitBuffer(8) = (uTime >> 16) And &HFF
@@ -3272,20 +3359,34 @@ Public Class FrmMain
                         ElseIf receiveBuffer(2) = 0 And receiveBuffer(3) = 8 Then
                             'This is an Set UTC Time request
                             UTCseconds = receiveBuffer(6) * 16777216 + receiveBuffer(7) * 65536 + receiveBuffer(8) * 256 + receiveBuffer(9)
-                            sendToLog(dispString, "Received a set UTC Time Request. Time = " & UTCseconds)
+                            SendToLog(dispString, "Received a set UTC Time Request. Time = " & UTCseconds)
                             ReceivedText(dispString, "Received a set UTC Time Request. Time = " & UTCseconds)
                             SendLinkAck()
                             If forceNak = True Then
-                                reset_state()
+                                Reset_state()
                             Else
-                                pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                                PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                                 xmitBuffer(0) = 8
                                 xmitBuffer(1) = 2
                                 xmitBuffer(2) = 0
                                 xmitBuffer(3) = 3
                                 xmitBuffer(4) = 2
                                 xmitBuffer(5) = &H80
-                                xmitBuffer(6) = 0
+                                If rbMode1.Checked = True Then
+                                    'This is a UCM
+                                    If cbInterRespCode.SelectedIndex = 7 Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                Else
+                                    'This is an SGD
+                                    If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                End If
                                 pendingAck = 0  'Set the pendingAck to nothing
                                 pendingLinkAck = True  'Set the pendingLinkAck to true
                                 SendComData(xmitBuffer, 7, "Sent Set UTC Time Response", pendingLinkAck)
@@ -3295,9 +3396,14 @@ Public Class FrmMain
                         End If
 
                     ElseIf receiveBuffer(5) = &H80 Then
+                        If receiveBuffer(6) < 8 Then
+                            cbInterRespCodeRecv.SelectedIndex = receiveBuffer(6)
+                        Else
+                            cbInterRespCodeRecv.SelectedIndex = 8
+                        End If
                         If receiveBuffer(2) = 0 And receiveBuffer(3) = 3 Then
                             'This is an Set UTC Time response from the SGD
-                            sendToLog(dispString, "Received a Set UTC Time response")
+                            SendToLog(dispString, "Received a Set UTC Time response")
                             ReceivedText(dispString, "Received a Set UTC Time Response")
                             SendLinkAck()
                             'Delete last message from buffer
@@ -3309,7 +3415,7 @@ Public Class FrmMain
                             UTCseconds = UTCseconds + (receiveBuffer(8) * 65536)
                             UTCseconds = UTCseconds + (receiveBuffer(9) * 256)
                             UTCseconds = UTCseconds + receiveBuffer(10)
-                            sendToLog(dispString, "Received Get UTC Time response. Time = " & UTCseconds)
+                            SendToLog(dispString, "Received Get UTC Time response. Time = " & UTCseconds)
                             ReceivedText(dispString, "Received Get UTC Time Resonse. Time = " & UTCseconds)
                             SendLinkAck()
                             'Delete Last message from buffer
@@ -3322,38 +3428,60 @@ Public Class FrmMain
                     If receiveBuffer(5) = 0 Then        'Get/Set Energy Price request
                         If receiveBuffer(2) = 0 And receiveBuffer(3) = 2 Then       'Get Energy Price request
                             'This is a Get Energy Price Request
-                            sendToLog(dispString, "Received a Get Energy Price Request")
+                            SendToLog(dispString, "Received a Get Energy Price Request")
                             ReceivedText(dispString, "Received a Get Energy Price Request")
-                            pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                            PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                             SendLinkAck()
                             If forceNak = True Then
-                                reset_state()
+                                Reset_state()
                             Else
-                                'Build a dummy responce header
-                                'This function is not yet supported but this code will return fixed data
-                                pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                                PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                                 xmitBuffer(0) = 8
                                 xmitBuffer(1) = 2
                                 xmitBuffer(2) = 0
-                                xmitBuffer(3) = 14
+                                xmitBuffer(3) = 18
                                 xmitBuffer(4) = 3
                                 xmitBuffer(5) = &H80
-                                xmitBuffer(6) = 0       'Response code
-                                xmitBuffer(7) = &H7     'Current price 1800 $0.18)
-                                xmitBuffer(8) = &H8
-                                xmitBuffer(9) = &H3     'Currency code
-                                xmitBuffer(10) = &H48
-                                xmitBuffer(11) = 4      'Digita after decimal
-                                xmitBuffer(12) = &H1B   'Expire time/date 1/1/2000
-                                xmitBuffer(13) = &HCE
-                                xmitBuffer(14) = &H96
-                                xmitBuffer(15) = &H5C
-                                xmitBuffer(16) = &H4   'Next price 1200 ($0.12)
-                                xmitBuffer(17) = &HB0
+                                If rbMode1.Checked = True Then
+                                    'This is a UCM
+                                    If cbInterRespCode.SelectedIndex = 7 Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                Else
+                                    'This is an SGD
+                                    If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                End If
+                                xmitBuffer(7) = (nudCurrentPrice.Value >> 24) And &HFF     'Current price
+                                xmitBuffer(8) = (nudCurrentPrice.Value >> 16) And &HFF
+                                xmitBuffer(9) = (nudCurrentPrice.Value >> 8) And &HFF
+                                xmitBuffer(10) = nudCurrentPrice.Value And &HFF
+                                xmitBuffer(11) = (nudCurrencyCode.Value >> 8) And &HFF     'Currency code
+                                xmitBuffer(12) = nudCurrencyCode.Value And &HFF
+                                xmitBuffer(13) = nudDigitsAfterDecimal.Value      'Digits after decimal
+                                'Build expiration time
+                                uTime = (dtpExpTime.Value - startDate).TotalSeconds
+                                If uTime < 946684800 Then
+                                    uTime = 946684800
+                                End If
+                                uTime -= 946684800      'Conver Unix time to seconds since 1/1/2000
+                                xmitBuffer(17) = uTime And &HFF
+                                xmitBuffer(16) = (uTime >> 8) And &HFF
+                                xmitBuffer(15) = (uTime >> 16) And &HFF
+                                xmitBuffer(14) = (uTime >> 24) And &HFF
+                                xmitBuffer(18) = (nudNextPrice.Value >> 24) And &HFF   'Next price
+                                xmitBuffer(19) = (nudNextPrice.Value >> 16) And &HFF
+                                xmitBuffer(20) = (nudNextPrice.Value >> 8) And &HFF
+                                xmitBuffer(21) = nudNextPrice.Value And &HFF
                                 'Send responce
                                 expectingResponse = False
                                 pendingLinkAck = True
-                                SendComData(xmitBuffer, 18, "Sent Get Energy Price Request Reply", pendingLinkAck)
+                                SendComData(xmitBuffer, 22, "Sent Get Energy Price Request Reply", pendingLinkAck)
 
                                 'Clear Buffer
                                 receiveIndex = 0
@@ -3361,23 +3489,47 @@ Public Class FrmMain
 
                         ElseIf receiveBuffer(2) = 0 And receiveBuffer(3) > 2 Then   'Set Energy Price request
                             'This is a Set Energy Price Request
-                            sendToLog(dispString, "Received a Set Energy Price Request")
+                            nudNextPrice.Value = 0
+                            SendToLog(dispString, "Received a Set Energy Price Request")
                             ReceivedText(dispString, "Received a Set Energy Price Request")
-                            pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                            PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                             SendLinkAck()
+                            nudCurrentPrice.Value = (receiveBuffer(6) * 16777216) + (receiveBuffer(7) * 65536) + (receiveBuffer(8) * 256) + receiveBuffer(9)     'Current price
+                            nudCurrencyCode.Value = (receiveBuffer(10) * 256) + receiveBuffer(11)     'Currency code
+                            nudDigitsAfterDecimal.Value = receiveBuffer(12)        'Digits after decimal
+                            If receiveBuffer(3) > 9 Then
+                                UTCseconds = (receiveBuffer(13) * 16777216) + (receiveBuffer(14) * 65536) + (receiveBuffer(15) * 256) + receiveBuffer(16)    'Expire time/date 1/1/2000
+                                UTCseconds += 946684800
+                                dtpExpTime.Value = TimeZoneInfo.ConvertTimeToUtc(UnixTimeStampToDateTime(UTCseconds))
+                            End If
+                            If receiveBuffer(3) > 13 Then
+                                nudNextPrice.Value = (receiveBuffer(17) * 16777216) + (receiveBuffer(18) * 65536) + (receiveBuffer(19) * 256) + receiveBuffer(20)    'Next price
+                            End If
                             If forceNak = True Then
-                                reset_state()
+                                Reset_state()
                             Else
-                                'Build a dummy responce header
-                                'This function is not yet supported but this code will return fixed data
-                                pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                                PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                                 xmitBuffer(0) = 8
                                 xmitBuffer(1) = 2
                                 xmitBuffer(2) = 0
                                 xmitBuffer(3) = 3
                                 xmitBuffer(4) = 3
                                 xmitBuffer(5) = &H80
-                                xmitBuffer(6) = 0       'Response code
+                                If rbMode1.Checked = True Then
+                                    'This is a UCM
+                                    If cbInterRespCode.SelectedIndex = 7 Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                Else
+                                    'This is an SGD
+                                    If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                End If
                                 'Send responce
                                 expectingResponse = False
                                 pendingLinkAck = True
@@ -3387,16 +3539,19 @@ Public Class FrmMain
                                 receiveIndex = 0
                             End If
                         End If
-                    End If
-
-                    If receiveBuffer(5) = &H80 Then        'Get/Set Energy Price request reaponse
+                    ElseIf receiveBuffer(5) = &H80 Then        'Get/Set Energy Price request reaponse
+                        If receiveBuffer(6) < 8 Then
+                            cbInterRespCodeRecv.SelectedIndex = receiveBuffer(6)
+                        Else
+                            cbInterRespCodeRecv.SelectedIndex = 8
+                        End If
                         If receiveBuffer(2) = 0 And receiveBuffer(3) = 3 Then       'Set Energy Price request response
-                            sendToLog(dispString, "Received a Set Energy Price request response")
+                            SendToLog(dispString, "Received a Set Energy Price request response")
                             ReceivedText(dispString, "Received a Set Energy Price request response")
-                            pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                            PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                             SendLinkAck()
                             If forceNak = True Then
-                                reset_state()
+                                Reset_state()
                             Else
                                 expectingResponse = False
                                 'Clear Buffer
@@ -3404,12 +3559,23 @@ Public Class FrmMain
                             End If
 
                         ElseIf receiveBuffer(2) = 0 And receiveBuffer(3) > 3 Then   'Get Energy Price request response
-                            sendToLog(dispString, "Received a Get Energy Price request response")
+                            SendToLog(dispString, "Received a Get Energy Price request response")
                             ReceivedText(dispString, "Received a Get Energy Price request response")
-                            pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                            PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                             SendLinkAck()
+                            nudCurrentPrice.Value = (receiveBuffer(7) * 16777216) + (receiveBuffer(8) * 65536) + (receiveBuffer(9) * 256) + receiveBuffer(10)     'Current price
+                            nudCurrencyCode.Value = (receiveBuffer(11) * 256) + receiveBuffer(12)     'Currency code
+                            nudDigitsAfterDecimal.Value = receiveBuffer(13)        'Digits after decimal
+                            If receiveBuffer(3) > 10 Then
+                                UTCseconds = (receiveBuffer(14) * 16777216) + (receiveBuffer(15) * 65536) + (receiveBuffer(16) * 256) + receiveBuffer(17)    'Expire time/date 1/1/2000
+                                UTCseconds += 946684800
+                                dtpExpTime.Value = TimeZoneInfo.ConvertTimeToUtc(UnixTimeStampToDateTime(UTCseconds))
+                            End If
+                            If receiveBuffer(3) > 14 Then
+                                nudNextPrice.Value = (receiveBuffer(18) * 16777216) + (receiveBuffer(19) * 65536) + (receiveBuffer(20) * 256) + receiveBuffer(21)    'Next price
+                            End If
                             If forceNak = True Then
-                                reset_state()
+                                Reset_state()
                             Else
                                 expectingResponse = False
                                 'Clear Buffer
@@ -3417,28 +3583,40 @@ Public Class FrmMain
                             End If
 
                         End If
-                    End If
-
-                    If receiveBuffer(5) = 1 Then        'Get/Set Tier request
+                    ElseIf receiveBuffer(5) = 1 Then        'Get/Set Tier request
                         If receiveBuffer(2) = 0 And receiveBuffer(3) = 2 Then       'Get Energy Price request
                             'This is a Get Tier Request
-                            sendToLog(dispString, "Received a Get Tier Request")
+                            SendToLog(dispString, "Received a Get Tier Request")
                             ReceivedText(dispString, "Received a Get Tier Request")
-                            pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                            PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                             SendLinkAck()
                             If forceNak = True Then
-                                reset_state()
+                                Reset_state()
                             Else
                                 'Build a dummy responce header
                                 'This function is not yet supported but this code will return fixed data
-                                pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                                PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                                 xmitBuffer(0) = 8
                                 xmitBuffer(1) = 2
                                 xmitBuffer(2) = 0
                                 xmitBuffer(3) = 9
                                 xmitBuffer(4) = 3
                                 xmitBuffer(5) = &H81
-                                xmitBuffer(6) = 0       'Response code
+                                If rbMode1.Checked = True Then
+                                    'This is a UCM
+                                    If cbInterRespCode.SelectedIndex = 7 Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                Else
+                                    'This is an SGD
+                                    If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                End If
                                 xmitBuffer(7) = &H2     'Current tier - 2
                                 xmitBuffer(8) = &H1B   'Expire time/date 1/1/2000
                                 xmitBuffer(9) = &HCE
@@ -3456,23 +3634,37 @@ Public Class FrmMain
 
                         ElseIf receiveBuffer(2) = 0 And receiveBuffer(3) > 2 Then   'Set Tier request
                             'This is a Set Energy Price Request
-                            sendToLog(dispString, "Received a Set Tier Request")
+                            SendToLog(dispString, "Received a Set Tier Request")
                             ReceivedText(dispString, "Received a Set Tier Request")
-                            pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                            PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                             SendLinkAck()
                             If forceNak = True Then
-                                reset_state()
+                                Reset_state()
                             Else
                                 'Build a dummy responce header
                                 'This function is not yet supported but this code will return fixed data
-                                pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                                PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                                 xmitBuffer(0) = 8
                                 xmitBuffer(1) = 2
                                 xmitBuffer(2) = 0
                                 xmitBuffer(3) = 3
                                 xmitBuffer(4) = 3
                                 xmitBuffer(5) = &H81
-                                xmitBuffer(6) = 0       'Response code
+                                If rbMode1.Checked = True Then
+                                    'This is a UCM
+                                    If cbInterRespCode.SelectedIndex = 7 Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                Else
+                                    'This is an SGD
+                                    If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                End If
                                 'Send responce
                                 expectingResponse = False
                                 pendingLinkAck = True
@@ -3482,16 +3674,19 @@ Public Class FrmMain
                                 receiveIndex = 0
                             End If
                         End If
-                    End If
-
-                    If receiveBuffer(5) = &H81 Then        'Get/Set Tier request response
+                    ElseIf receiveBuffer(5) = &H81 Then        'Get/Set Tier request response
+                        If receiveBuffer(6) < 8 Then
+                            cbInterRespCodeRecv.SelectedIndex = receiveBuffer(6)
+                        Else
+                            cbInterRespCodeRecv.SelectedIndex = 8
+                        End If
                         If receiveBuffer(2) = 0 And receiveBuffer(3) = 3 Then       'Set Tier request response
-                            sendToLog(dispString, "Received a Set Tier request response")
+                            SendToLog(dispString, "Received a Set Tier request response")
                             ReceivedText(dispString, "Received a Set Tier request response")
-                            pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                            PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                             SendLinkAck()
                             If forceNak = True Then
-                                reset_state()
+                                Reset_state()
                             Else
                                 expectingResponse = False
                                 'Clear Buffer
@@ -3499,12 +3694,12 @@ Public Class FrmMain
                             End If
 
                         ElseIf receiveBuffer(2) = 0 And receiveBuffer(3) > 3 Then   'Get Tier request response
-                            sendToLog(dispString, "Received a Get Tier request response")
+                            SendToLog(dispString, "Received a Get Tier request response")
                             ReceivedText(dispString, "Received a Get Tier request response")
-                            pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                            PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                             SendLinkAck()
                             If forceNak = True Then
-                                reset_state()
+                                Reset_state()
                             Else
                                 expectingResponse = False
                                 'Clear Buffer
@@ -3512,29 +3707,41 @@ Public Class FrmMain
                             End If
 
                         End If
+
                     End If
 
                     If receiveBuffer(5) = 2 And receiveBuffer(2) = 0 And receiveBuffer(3) = 2 Then        'Get Temperature Offset
                         'This is a Get Temperature Offset Request
-                        sendToLog(dispString, "Received a Get Temperature Offset request")
+                        SendToLog(dispString, "Received a Get Temperature Offset request")
                         ReceivedText(dispString, "Received a Get Temperature Offset Request")
-                        pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                        PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             'Build a responce header
-                            pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 2
                             xmitBuffer(2) = 0
                             xmitBuffer(3) = 5
                             xmitBuffer(4) = 3
                             xmitBuffer(5) = &H82
-
-                            'Response Code Currently 0
-                            xmitBuffer(6) = 0
-
+                            If rbMode1.Checked = True Then
+                                'This is a UCM
+                                If cbInterRespCode.SelectedIndex = 7 Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            Else
+                                'This is an SGD
+                                If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            End If
                             'Get current offset
                             xmitBuffer(7) = nudTempOffset.Value And &HFF
 
@@ -3556,12 +3763,12 @@ Public Class FrmMain
 
                     ElseIf receiveBuffer(5) = 2 And receiveBuffer(2) = 0 And receiveBuffer(3) = 4 Then        'Set Temperature Offset
                         'This is a Set Temperature Offset Request
-                        sendToLog(dispString, "Received a Set Temperature Offset Request")
+                        SendToLog(dispString, "Received a Set Temperature Offset Request")
                         ReceivedText(dispString, "Received a Set Temperature Offset Request")
-                        pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                        PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             'Interpret the data
                             'Get offset
@@ -3577,17 +3784,28 @@ Public Class FrmMain
                             End If
 
                             'Build a responce header
-                            pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 2
                             xmitBuffer(2) = 0
                             xmitBuffer(3) = 3
                             xmitBuffer(4) = 3
                             xmitBuffer(5) = &H82
-
-                            'Response Code Currently 0
-                            xmitBuffer(6) = 0
-
+                            If rbMode1.Checked = True Then
+                                'This is a UCM
+                                If cbInterRespCode.SelectedIndex = 7 Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            Else
+                                'This is an SGD
+                                If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            End If
                             'Send responce
                             expectingResponse = False
                             pendingLinkAck = True
@@ -3599,12 +3817,17 @@ Public Class FrmMain
 
                     ElseIf receiveBuffer(5) = &H82 And receiveBuffer(2) = 0 And receiveBuffer(3) = 5 Then        'Get Temperature Offset Reply
                         'This is a Get Temperature Offset Reply
-                        sendToLog(dispString, "Received a Get Temperature Offset Reply")
+                        If receiveBuffer(6) < 8 Then
+                            cbInterRespCodeRecv.SelectedIndex = receiveBuffer(6)
+                        Else
+                            cbInterRespCodeRecv.SelectedIndex = 8
+                        End If
+                        SendToLog(dispString, "Received a Get Temperature Offset Reply")
                         ReceivedText(dispString, "Received a Get Temperature Offset Reply")
-                        pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                        PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             'Interpret the data
                             'Get response code
@@ -3631,11 +3854,16 @@ Public Class FrmMain
 
                     ElseIf receiveBuffer(5) = &H82 And receiveBuffer(2) = 0 And receiveBuffer(3) = 3 Then        'Set Temperature Offset Reply
                         'This is a Set Temperature Offset Reply
-                        sendToLog(dispString, "Received a Set Temperature Offset Reply")
+                        If receiveBuffer(6) < 8 Then
+                            cbInterRespCodeRecv.SelectedIndex = receiveBuffer(6)
+                        Else
+                            cbInterRespCodeRecv.SelectedIndex = 8
+                        End If
+                        SendToLog(dispString, "Received a Set Temperature Offset Reply")
                         ReceivedText(dispString, "Received a Set Temperature Offset Reply")
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             'Interpret the data
                             'Get response code
@@ -3648,25 +3876,36 @@ Public Class FrmMain
 
                     ElseIf receiveBuffer(5) = 3 And receiveBuffer(2) = 0 And receiveBuffer(3) = 2 Then        'Get Setpoint Request
                         'This is a Get Setpoint Request
-                        sendToLog(dispString, "Received a Get Setpoint Request")
+                        SendToLog(dispString, "Received a Get Setpoint Request")
                         ReceivedText(dispString, "Received a Get Setpoint Request")
-                        pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                        PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             'Build a responce header
-                            pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 2
                             xmitBuffer(2) = 0
                             xmitBuffer(3) = 8
                             xmitBuffer(4) = 3
                             xmitBuffer(5) = &H83
-
-                            'Response Code Currently 0
-                            xmitBuffer(6) = 0
-
+                            If rbMode1.Checked = True Then
+                                'This is a UCM
+                                If cbInterRespCode.SelectedIndex = 7 Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            Else
+                                'This is an SGD
+                                If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            End If
                             'Device Type
                             xmitBuffer(7) = (nudSetpointDeviceType.Value >> 8) And &HFF
                             xmitBuffer(8) = nudSetpointDeviceType.Value And &HFF
@@ -3704,12 +3943,12 @@ Public Class FrmMain
 
                     ElseIf receiveBuffer(5) = 3 And receiveBuffer(2) = 0 And (receiveBuffer(3) = 7 Or receiveBuffer(3) = 9) Then        'Set Setpoint Request
                         'This is a Set Setpoint Request
-                        sendToLog(dispString, "Received a Set Setpoint Request")
+                        SendToLog(dispString, "Received a Set Setpoint Request")
                         ReceivedText(dispString, "Received a Set Setpoint Request")
-                        pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                        PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             'Display Device Type
                             tbSgdDeviceType.Text = Convert.ToString(((receiveBuffer(6) * 256) + receiveBuffer(7)), 16).PadLeft(4, "0"c).ToUpper
@@ -3761,17 +4000,28 @@ Public Class FrmMain
                             End If
 
                             'Build a responce header
-                            pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 2
                             xmitBuffer(2) = 0
                             xmitBuffer(3) = 3
                             xmitBuffer(4) = 3
                             xmitBuffer(5) = &H83
-
-                            'Response Code Currently 0
-                            xmitBuffer(6) = 0
-
+                            If rbMode1.Checked = True Then
+                                'This is a UCM
+                                If cbInterRespCode.SelectedIndex = 7 Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            Else
+                                'This is an SGD
+                                If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            End If
                             'Send responce
                             expectingResponse = False
                             pendingLinkAck = True
@@ -3783,12 +4033,17 @@ Public Class FrmMain
 
                     ElseIf receiveBuffer(5) = &H83 And receiveBuffer(2) = 0 And (receiveBuffer(3) = 8 Or receiveBuffer(3) = 10) Then        'Get Setpoint Reply
                         'This is a Set Setpoint Reply
-                        sendToLog(dispString, "Received a Get Setpoint Reply")
+                        If receiveBuffer(6) < 8 Then
+                            cbInterRespCodeRecv.SelectedIndex = receiveBuffer(6)
+                        Else
+                            cbInterRespCodeRecv.SelectedIndex = 8
+                        End If
+                        SendToLog(dispString, "Received a Get Setpoint Reply")
                         ReceivedText(dispString, "Received a Get Setpoint Reply")
-                        pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                        PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             'Display Response Code
                             tbSetpointResponseCode.Text = receiveBuffer(6)
@@ -3850,12 +4105,17 @@ Public Class FrmMain
 
                     ElseIf receiveBuffer(5) = &H83 And receiveBuffer(2) = 0 And receiveBuffer(3) = 3 Then        'Set Setpoint Reply
                         'This is a Set Setpoint Reply
-                        sendToLog(dispString, "Received a Set Setpoint Reply")
+                        If receiveBuffer(6) < 8 Then
+                            cbInterRespCodeRecv.SelectedIndex = receiveBuffer(6)
+                        Else
+                            cbInterRespCodeRecv.SelectedIndex = 8
+                        End If
+                        SendToLog(dispString, "Received a Set Setpoint Reply")
                         ReceivedText(dispString, "Received a Set Setpoint Reply")
-                        pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                        PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             tbSetpointResponseCode.Text = receiveBuffer(6)
                             expectingResponse = False
@@ -3864,25 +4124,36 @@ Public Class FrmMain
 
                     ElseIf receiveBuffer(5) = 4 And receiveBuffer(2) = 0 And receiveBuffer(3) = 2 Then        'Get Present Temperature Request
                         'This is a Get Present Temperature Request
-                        sendToLog(dispString, "Received a Get Present Temperature Request")
+                        SendToLog(dispString, "Received a Get Present Temperature Request")
                         ReceivedText(dispString, "Received a Get Present Temperature Request")
-                        pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                        PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             'Build a responce header
-                            pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 2
                             xmitBuffer(2) = 0
                             xmitBuffer(3) = 8
                             xmitBuffer(4) = 3
                             xmitBuffer(5) = &H84
-
-                            'Response Code Currently 0
-                            xmitBuffer(6) = 0
-
+                            If rbMode1.Checked = True Then
+                                'This is a UCM
+                                If cbInterRespCode.SelectedIndex = 7 Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            Else
+                                'This is an SGD
+                                If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            End If
                             'Device Type
                             xmitBuffer(7) = (nudSetpointDeviceType.Value >> 8) And &HFF
                             xmitBuffer(8) = nudSetpointDeviceType.Value And &HFF
@@ -3909,12 +4180,17 @@ Public Class FrmMain
 
                     ElseIf receiveBuffer(5) = &H84 And receiveBuffer(2) = 0 And receiveBuffer(3) = 8 Then        'Get Present Temperature Reply
                         'This is a Get Present Temperature Reply
-                        sendToLog(dispString, "Received a Get Present Temperature Reply")
+                        If receiveBuffer(6) < 8 Then
+                            cbInterRespCodeRecv.SelectedIndex = receiveBuffer(6)
+                        Else
+                            cbInterRespCodeRecv.SelectedIndex = 8
+                        End If
+                        SendToLog(dispString, "Received a Get Present Temperature Reply")
                         ReceivedText(dispString, "Received a Get Present Temperature Reply")
-                        pauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
+                        PauseMS(tMAValBox.Value)      'Wait 40ms before sending Link Ack
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             tbResponseCode2.Text = receiveBuffer(6)
                             tbSgdDeviceType.Text = Convert.ToString(((receiveBuffer(7) * 256) + receiveBuffer(8)), 16).PadLeft(4, "0"c).ToUpper
@@ -3932,53 +4208,86 @@ Public Class FrmMain
                 Case 4
                     If receiveBuffer(5) = 0 Then    'receiveBuffer(2) = 0
                         'This is a request to start Autonomous Cycling
-                        sendToLog(dispString, "Received a request to start Autonomous Cycling")
+                        SendToLog(dispString, "Received a request to start Autonomous Cycling")
                         ReceivedText(dispString, "Received a request to start Autonomous Cycling")
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             receiveIndex = 0
 
                             'Send reply
-                            pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 2
                             xmitBuffer(2) = 0
                             xmitBuffer(3) = 3
                             xmitBuffer(4) = &H4
                             xmitBuffer(5) = &H80
-                            xmitBuffer(6) = 0
+                            If rbMode1.Checked = True Then
+                                'This is a UCM
+                                If cbInterRespCode.SelectedIndex = 7 Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            Else
+                                'This is an SGD
+                                If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            End If
                             pendingLinkAck = True
                             SendComData(xmitBuffer, 7, "Sent Autonomous Cycling Response", pendingLinkAck)
                         End If
 
                     ElseIf receiveBuffer(5) = 1 Then    'receiveBuffer(2) = 0
                         'This is a request to end Autonomous Cycling 
-                        sendToLog(dispString, "Received a request to end Autonomous Cycling")
+                        SendToLog(dispString, "Received a request to end Autonomous Cycling")
                         ReceivedText(dispString, "Received a request to end Autonomous Cycling")
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             receiveIndex = 0
 
                             'Send reply
-                            pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 2
                             xmitBuffer(2) = 0
                             xmitBuffer(3) = 3
                             xmitBuffer(4) = &H4
                             xmitBuffer(5) = &H81
-                            xmitBuffer(6) = 0
+                            If rbMode1.Checked = True Then
+                                'This is a UCM
+                                If cbInterRespCode.SelectedIndex = 7 Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            Else
+                                'This is an SGD
+                                If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            End If
                             pendingLinkAck = True
                             SendComData(xmitBuffer, 7, "Sent Response to End Autonomous Cycling Command", pendingLinkAck)
                         End If
 
                     ElseIf receiveBuffer(5) = &H80 Then     'receiveBuffer(2) = 0 And receiveBuffer(3) = 3 
                         'This is a reply to a start Autonomous Cycling Request
-                        sendToLog(dispString, "Received a reply to a Start Autonomous Cycling Request")
+                        If receiveBuffer(6) < 8 Then
+                            cbInterRespCodeRecv.SelectedIndex = receiveBuffer(6)
+                        Else
+                            cbInterRespCodeRecv.SelectedIndex = 8
+                        End If
+                        SendToLog(dispString, "Received a reply to a Start Autonomous Cycling Request")
                         ReceivedText(dispString, "Received a reply to a Start Autonomous Cycling Request")
                         SendLinkAck()
 
@@ -3986,7 +4295,12 @@ Public Class FrmMain
 
                     ElseIf receiveBuffer(5) = &H81 Then     'receiveBuffer(2) = 0 And receiveBuffer(3) = 3
                         'This is a reply to a stop Autonomous Cycling Request
-                        sendToLog(dispString, "Received a Stop Autonomous Cycling Request Reply")
+                        If receiveBuffer(6) < 8 Then
+                            cbInterRespCodeRecv.SelectedIndex = receiveBuffer(6)
+                        Else
+                            cbInterRespCodeRecv.SelectedIndex = 8
+                        End If
+                        SendToLog(dispString, "Received a Stop Autonomous Cycling Request Reply")
                         ReceivedText(dispString, "Received a Stop Autonomous Cycling Request Reply")
                         SendLinkAck()
 
@@ -3997,26 +4311,64 @@ Public Class FrmMain
 
                 Case 6
                     If receiveBuffer(5) = 0 Then
-                        If receiveBuffer(2) = 0 And receiveBuffer(3) = 2 Then
+                        If receiveBuffer(2) = 0 And receiveBuffer(3) < 4 Then
                             'This is a get commodity read request
-                            sendToLog(dispString, "Received a Get Commodity Read Request")
+                            SendToLog(dispString, "Received a Get Commodity Read Request")
                             ReceivedText(dispString, "Received a Get Commodity Read Request")
                             SendLinkAck()
                             If forceNak = True Then
-                                reset_state()
+                                Reset_state()
                             Else
                                 receiveIndex = 0
 
                                 'Send reply
-                                pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                                PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                                 xmitBuffer(0) = 8
                                 xmitBuffer(1) = 2
                                 xmitBuffer(4) = &H6
                                 xmitBuffer(5) = &H80
-                                xmitBuffer(6) = 0           'Response Code
+                                If rbMode1.Checked = True Then
+                                    'This is a UCM
+                                    If cbInterRespCode.SelectedIndex = 7 Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                Else
+                                    'This is an SGD
+                                    If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                End If
                                 j = 0
-                                For i = 0 To 7
-                                    If commodityArray(i).supported = True Then
+                                If receiveBuffer(3) = 2 Then
+                                    For i = 0 To 9
+                                        If commodityArray(i).supported = True Then
+                                            If commodityArray(i).estimated = True Then
+                                                xmitBuffer(j * 13 + 7) = i
+                                            Else
+                                                xmitBuffer(j * 13 + 7) = i + &H80
+                                            End If
+                                            xmitBuffer(j * 13 + 13) = commodityArray(i).instRate And &HFF
+                                            xmitBuffer(j * 13 + 12) = (commodityArray(i).instRate >> 8) And &HFF
+                                            xmitBuffer(j * 13 + 11) = (commodityArray(i).instRate >> 16) And &HFF
+                                            xmitBuffer(j * 13 + 10) = (commodityArray(i).instRate >> 24) And &HFF
+                                            xmitBuffer(j * 13 + 9) = (commodityArray(i).instRate >> 32) And &HFF
+                                            xmitBuffer(j * 13 + 8) = (commodityArray(i).instRate >> 40) And &HFF
+                                            xmitBuffer(j * 13 + 19) = commodityArray(i).cumAmount And &HFF
+                                            xmitBuffer(j * 13 + 18) = (commodityArray(i).cumAmount >> 8) And &HFF
+                                            xmitBuffer(j * 13 + 17) = (commodityArray(i).cumAmount >> 16) And &HFF
+                                            xmitBuffer(j * 13 + 16) = (commodityArray(i).cumAmount >> 24) And &HFF
+                                            xmitBuffer(j * 13 + 15) = (commodityArray(i).cumAmount >> 32) And &HFF
+                                            xmitBuffer(j * 13 + 14) = (commodityArray(i).cumAmount >> 40) And &HFF
+                                            j += 1
+                                        End If
+                                    Next i
+                                Else
+                                    If commodityArray(receiveBuffer(6)).supported = True Then
+                                        i = receiveBuffer(6)
                                         If commodityArray(i).estimated = True Then
                                             xmitBuffer(j * 13 + 7) = i
                                         Else
@@ -4034,9 +4386,9 @@ Public Class FrmMain
                                         xmitBuffer(j * 13 + 16) = (commodityArray(i).cumAmount >> 24) And &HFF
                                         xmitBuffer(j * 13 + 15) = (commodityArray(i).cumAmount >> 32) And &HFF
                                         xmitBuffer(j * 13 + 14) = (commodityArray(i).cumAmount >> 40) And &HFF
-                                        j += 1
+                                        j = 1
                                     End If
-                                Next i
+                                End If
                                 If j = 0 Then
                                     xmitBuffer(6) = 2           'Response Code data error
                                 End If
@@ -4049,11 +4401,11 @@ Public Class FrmMain
 
                         Else
                             'This is a set commodity read request
-                            sendToLog(dispString, "Received a Set Commodity Request")
+                            SendToLog(dispString, "Received a Set Commodity Request")
                             ReceivedText(dispString, "Received a Set Commodity Request")
                             SendLinkAck()
                             If forceNak = True Then
-                                reset_state()
+                                Reset_state()
                             Else
                                 j = receiveBuffer(3) - 2        'Calculate the number of records
                                 j = j / 13
@@ -4099,40 +4451,54 @@ Public Class FrmMain
                                 Next
                                 receiveIndex = 0
                                 'Send reply
-                                pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                                PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                                 xmitBuffer(0) = 8
                                 xmitBuffer(1) = 2
                                 xmitBuffer(2) = 0
                                 xmitBuffer(3) = 3
                                 xmitBuffer(4) = &H6
                                 xmitBuffer(5) = &H80
-                                xmitBuffer(6) = 0       'Send response code
+                                If rbMode1.Checked = True Then
+                                    'This is a UCM
+                                    If cbInterRespCode.SelectedIndex = 7 Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                Else
+                                    'This is an SGD
+                                    If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                        xmitBuffer(6) = 0           'Response code
+                                    Else
+                                        xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                    End If
+                                End If
                                 pendingLinkAck = True
                                 SendComData(xmitBuffer, 7, "Sent Set Commodity Response", pendingLinkAck)
                                 ReceivedText("", "Received a Set Commodity Read Request.")
-                                lbCommodityCode_SelectedIndexChanged(Ex_sender, Ex_e)
+                                LbCommodityCode_SelectedIndexChanged(Ex_sender, Ex_e)
                             End If
                         End If
 
                     ElseIf receiveBuffer(5) = &H1 And receiveBuffer(2) = 0 And receiveBuffer(3) = 2 Then
                         'This is a get commodity subscription request
-                        sendToLog(dispString, "Received a Get Commodity Subscription Request")
+                        SendToLog(dispString, "Received a Get Commodity Subscription Request")
                         ReceivedText(dispString, "Received a Get Commodity Subscription Request")
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             receiveIndex = 0
 
                             'Send reply
-                            pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 2
                             xmitBuffer(4) = &H6
                             xmitBuffer(5) = &H81
                             j = 0
                             xmitBuffer(6) = 0       'Response Code
-                            For i = 0 To 7
+                            For i = 0 To 9
                                 If commodityArray(i).supported = True Then
                                     xmitBuffer(j * 3 + 7) = i       'Commodity type supported
                                     xmitBuffer(j * 3 + 9) = commodityArray(i).updateFreq And &HFF
@@ -4154,16 +4520,16 @@ Public Class FrmMain
 
                     ElseIf receiveBuffer(5) = &H1 And receiveBuffer(2) = 0 And receiveBuffer(3) >= 5 Then
                         'This is a set commodity subscription request
-                        sendToLog(dispString, "Received a Set Commodity Subscription Request")
+                        SendToLog(dispString, "Received a Set Commodity Subscription Request")
                         ReceivedText(dispString, "Received a Set Commodity Subscription Request")
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             j = receiveBuffer(2) * 256 + receiveBuffer(3)     'Calculate payload size
                             j = (j - 2) / 3                                   'Calculate number of entries
-                            xmitBuffer(6) = 0       'Set the response code to success
-                            For i = 0 To 7       'Clear the subscription frequency and the subscriptReq for all entries
+                            'xmitBuffer(6) = 0       'Set the response code to success
+                            For i = 0 To 9       'Clear the subscription frequency and the subscriptReq for all entries
                                 commodityArray(i).updateFreq = 0
                                 'commodityArray(i).subscriptReq = False
                             Next i
@@ -4175,14 +4541,28 @@ Public Class FrmMain
                             Next i
                             receiveIndex = 0
                             'Send reply
-                            pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 2
                             xmitBuffer(2) = 0
                             xmitBuffer(3) = 3
                             xmitBuffer(4) = &H6
                             xmitBuffer(5) = &H81
-                            'xmitBuffer(6) already contains response code
+                            If rbMode1.Checked = True Then
+                                'This is a UCM
+                                If cbInterRespCode.SelectedIndex = 7 Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            Else
+                                'This is an SGD
+                                If cbInterRespCode.SelectedIndex = 7 And chkCustOverride.Checked = False Then
+                                    xmitBuffer(6) = 0           'Response code
+                                Else
+                                    xmitBuffer(6) = cbInterRespCode.SelectedIndex           'Response code
+                                End If
+                            End If
                             pendingLinkAck = True
                             SendComData(xmitBuffer, 7, "Sent Response to Set Commodity Subsciption Request", pendingLinkAck)
                         End If
@@ -4190,23 +4570,23 @@ Public Class FrmMain
                     ElseIf receiveBuffer(5) = &H80 Then
                         If receiveBuffer(2) = 0 And receiveBuffer(3) = 2 Then
                             'This is a set commodity read reply with an empty result set
-                            sendToLog(dispString, "Received a Set Commodity Read Reply with an empty result set")
+                            SendToLog(dispString, "Received a Set Commodity Read Reply with an empty result set")
                             ReceivedText(dispString, "Received a Set Commodity Read Reply with an empty result set")
                             SendLinkAck()
                             receiveIndex = 0
                         ElseIf receiveBuffer(2) = 0 And receiveBuffer(3) = 3 Then
                             'This is a set commodity read reply
-                            sendToLog(dispString, "Received a Set Commodity Read Reply")
+                            SendToLog(dispString, "Received a Set Commodity Read Reply")
                             ReceivedText(dispString, "Received a Set Commodity Read Reply")
                             SendLinkAck()
                             receiveIndex = 0
                         ElseIf (receiveBuffer(2) * 256 + receiveBuffer(3)) > 3 Then
                             'This is a get commodity read reply
-                            sendToLog(dispString, "Received a Get Commodity Read Reply")
+                            SendToLog(dispString, "Received a Get Commodity Read Reply")
                             ReceivedText(dispString, "Received a Get Commodity Read Reply")
                             SendLinkAck()
                             If forceNak = True Then
-                                reset_state()
+                                Reset_state()
                             Else
                                 j = receiveBuffer(3) - 3        'Calculate the number of records
                                 j = j / 13
@@ -4250,21 +4630,43 @@ Public Class FrmMain
                                     tempLong += tempLong2 * tempLong3
                                     commodityArray2(indexVal).cumAmount = tempLong
                                 Next
+
+                                'updates fields when values are received
+                                tbCommodityRate.Text = commodityArray2(lbCommodityCode1.SelectedIndex).instRate
+                                tbCommodityAmount.Text = commodityArray2(lbCommodityCode1.SelectedIndex).cumAmount
+                                cbCommoditySupported1.Checked = commodityArray2(lbCommodityCode1.SelectedIndex).supported
+                                cbEstimated1.Checked = commodityArray2(lbCommodityCode1.SelectedIndex).estimated
+                                tbCommodityFreq.Text = commodityArray2(lbCommodityCode1.SelectedIndex).updateFreq
+                                'logs commodity if checked
+                                If CommodityLogChkBox.Checked = True Then
+                                    LogCommodity()
+                                End If
+
+                                'add commodities to graph data
+                                If CommodityChart.PauseCommodityGrphBTN.Text.ToLower() = "pause" Then
+                                    GraphCommodityUpdate()
+                                End If
+
                                 ReceivedText("", "Get Commodity Read Reply received")
-                                lbCommodityCode_SelectedIndexChanged(Ex_sender, Ex_e)   'simulate an index change to refresh values
+                                LbCommodityCode_SelectedIndexChanged(Ex_sender, Ex_e)   'simulate an index change to refresh values
                                 receiveIndex = 0
                             End If
                         End If
 
                     ElseIf receiveBuffer(5) = &H81 And receiveBuffer(2) = 0 And receiveBuffer(3) = 3 Then
                         'This is a set commodity subscription request reply
-                        sendToLog(dispString, "Received Set Commodity Subscription Request Reply")
+                        If receiveBuffer(6) < 8 Then
+                            cbInterRespCodeRecv.SelectedIndex = receiveBuffer(6)
+                        Else
+                            cbInterRespCodeRecv.SelectedIndex = 8
+                        End If
+                        SendToLog(dispString, "Received Set Commodity Subscription Request Reply")
                         ReceivedText(dispString, "Received Set Commodity Subscription Request Reply")
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            If receiveBuffer(6) = 0 Then
+                            If receiveBuffer(6) = 0 Or receiveBuffer(6) = 7 Then
                                 ReceivedText("", "Set Commodity Subscription Reply received")
                             Else
                                 ReceivedText("", "Get Commodity Subscription Reply Error received: " & receiveBuffer(6))
@@ -4274,11 +4676,11 @@ Public Class FrmMain
 
                     ElseIf receiveBuffer(5) = &H81 And receiveBuffer(2) = 0 And receiveBuffer(3) >= 6 Then
                         'This is a get commodity subscription request reply
-                        sendToLog(dispString, "Received a Get Commodity Subscription Request Reply")
+                        SendToLog(dispString, "Received a Get Commodity Subscription Request Reply")
                         ReceivedText(dispString, "Received a Get Commodity Subscription Request Reply")
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             If receiveBuffer(6) = 0 Then
                                 ReceivedText("", "Get Commodity Subscription Reply received")
@@ -4296,6 +4698,156 @@ Public Class FrmMain
                         End If
                     End If
 
+                Case &HA    'Get/Set Activation Status
+                    If receiveBuffer(5) = 0 Then        'Get Activation Status
+                        SendToLog(dispString, "Received a Get Activation Status")
+                        ReceivedText(dispString, "Received a Get Activation Status")
+                        SendLinkAck()
+                        If forceNak = True Then
+                            Reset_state()
+                        Else
+                            receiveIndex = 0
+                            'Send reply
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            xmitBuffer(0) = 8
+                            xmitBuffer(1) = 2
+                            xmitBuffer(2) = 0
+                            xmitBuffer(3) = 4
+                            xmitBuffer(4) = &HA
+                            xmitBuffer(5) = &H80
+                            xmitBuffer(6) = receiveBuffer(6)
+                            xmitBuffer(7) = actStatus(receiveBuffer(6))
+                            pendingLinkAck = True
+                            SendComData(xmitBuffer, 8, "Sent Get Activation Status Response", pendingLinkAck)
+                        End If
+
+                    ElseIf receiveBuffer(5) = 1 Then        'Set Activation Status
+                        'This is a request to Set Activation Status 
+                        SendToLog(dispString, "Received a request to Set Activation Status")
+                        ReceivedText(dispString, "Received a request to Set Activation Status")
+                        SendLinkAck()
+                        actStatus(receiveBuffer(6)) = receiveBuffer(7)
+                        nudActIndex.Value = receiveBuffer(6)
+                        nudActStatus.Value = receiveBuffer(7)
+                        tbActivateKey.Text = ""
+                        If receiveBuffer(3) > 4 Then
+                            For i = 0 To (receiveBuffer(3) - 5)
+                                tbActivateKey.Text = tbActivateKey.Text & Chr(receiveBuffer(8 + i))
+                            Next
+                        End If
+                        If forceNak = True Then
+                            Reset_state()
+                        Else
+                            receiveIndex = 0
+
+                            'Send reply
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            xmitBuffer(0) = 8
+                            xmitBuffer(1) = 2
+                            xmitBuffer(2) = 0
+                            xmitBuffer(3) = 4
+                            xmitBuffer(4) = &HA
+                            xmitBuffer(5) = &H81
+                            xmitBuffer(6) = receiveBuffer(6)
+                            xmitBuffer(7) = cbActResponse.SelectedIndex
+                            pendingLinkAck = True
+                            SendComData(xmitBuffer, 8, "Sent Response to End Autonomous Cycling Command", pendingLinkAck)
+                        End If
+
+                    ElseIf receiveBuffer(5) = &H80 Then
+                        'This is a reply to a Get Activation Status Request
+                        SendToLog(dispString, "Received a Get User Preference Level reply")
+                        ReceivedText(dispString, "Received a Get User Preference Level reply")
+                        preference(receiveBuffer(6)) = receiveBuffer(7)
+                        nudActIndex.Value = receiveBuffer(6)
+                        nudActStatus.Value = receiveBuffer(7)
+                        SendLinkAck()
+                        receiveIndex = 0
+
+                    ElseIf receiveBuffer(5) = &H81 Then
+                        'This is a reply to a Set Activation Status Request
+                        SendToLog(dispString, "Received a Set Activation Status Request reply")
+                        ReceivedText(dispString, "Received a Set Activation Status Request reply")
+                        nudActIndex.Value = receiveBuffer(6)
+                        If receiveBuffer(7) < 8 Then
+                            cbActResponse.SelectedIndex = receiveBuffer(7)
+                        Else
+                            cbActResponse.SelectedIndex = 8
+                        End If
+                        SendLinkAck()
+                        receiveIndex = 0
+                    End If
+
+                Case &HB    'Get/Set User Preference Level
+                    If receiveBuffer(5) = 0 Then        'Get User Preference Level
+                        SendToLog(dispString, "Received a Get User Preference Level")
+                        ReceivedText(dispString, "Received a Get User Preference Level")
+                        SendLinkAck()
+                        If forceNak = True Then
+                            Reset_state()
+                        Else
+                            receiveIndex = 0
+                            'Send reply
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            xmitBuffer(0) = 8
+                            xmitBuffer(1) = 2
+                            xmitBuffer(2) = 0
+                            xmitBuffer(3) = 4
+                            xmitBuffer(4) = &HB
+                            xmitBuffer(5) = &H80
+                            xmitBuffer(6) = receiveBuffer(6)
+                            xmitBuffer(7) = preference(receiveBuffer(6))
+                            pendingLinkAck = True
+                            SendComData(xmitBuffer, 8, "Sent Get User Preference Level Response", pendingLinkAck)
+                        End If
+
+                    ElseIf receiveBuffer(5) = 1 Then        'Set User Preference Level
+                        'This is a request to Set User Preference Level 
+                        SendToLog(dispString, "Received a request to Set User Preference Level")
+                        ReceivedText(dispString, "Received a request to Set User Preference Level")
+                        SendLinkAck()
+                        preference(receiveBuffer(6)) = receiveBuffer(7)
+                        nudPrefType.Value = receiveBuffer(6)
+                        nudPrefLevel.Value = receiveBuffer(7)
+                        If forceNak = True Then
+                            Reset_state()
+                        Else
+                            receiveIndex = 0
+
+                            'Send reply
+                            PauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                            xmitBuffer(0) = 8
+                            xmitBuffer(1) = 2
+                            xmitBuffer(2) = 0
+                            xmitBuffer(3) = 4
+                            xmitBuffer(4) = &HB
+                            xmitBuffer(5) = &H81
+                            xmitBuffer(6) = nudPrefType.Value
+                            xmitBuffer(7) = nudPrefLevel.Value
+                            pendingLinkAck = True
+                            SendComData(xmitBuffer, 8, "Sent Response to End Autonomous Cycling Command", pendingLinkAck)
+                        End If
+
+                    ElseIf receiveBuffer(5) = &H80 Then
+                        'This is a reply to a Get User Preference Level Request
+                        SendToLog(dispString, "Received a Get User Preference Level reply")
+                        ReceivedText(dispString, "Received a Get User Preference Level reply")
+                        preference(receiveBuffer(6)) = receiveBuffer(7)
+                        nudPrefType.Value = receiveBuffer(6)
+                        nudPrefLevel.Value = receiveBuffer(7)
+                        SendLinkAck()
+                        receiveIndex = 0
+
+                    ElseIf receiveBuffer(5) = &H81 Then
+                        'This is a reply to a Set User Preference Level Request
+                        SendToLog(dispString, "Received a Set User Preference Level reply")
+                        ReceivedText(dispString, "Received a Set User Preference Level reply")
+                        nudPrefType.Value = receiveBuffer(6)
+                        nudPrefLevel.Value = receiveBuffer(7)
+                        SendLinkAck()
+                        receiveIndex = 0
+                    End If
+
                 Case Else       'Invalid opcode 2
                     'Future create error handler
             End Select
@@ -4303,18 +4855,32 @@ Public Class FrmMain
     End Sub
 
     'Processes Data Link Message
-    Private Sub processDataLinkMsg(ByVal dispString As String)
+    Private Sub ProcessDataLinkMsg(ByVal dispString As String)
 
         Dim xmitBuffer(8) As Byte
 
         Select Case receiveBuffer(4)
+            Case &H16               'This is a request different power mode
+                ReceivedText(dispString, "Request different power mode received")
+                SendToLog(dispString, "Request different power mode received")
+                If cbPowerLimit.Checked = True Then
+                    If receiveBuffer(5) < 6 Then
+                        nudPowerLimit.Value = receiveBuffer(5)
+                        SendLinkAck()
+                    Else
+                        SendLinkNak(1)      'Invalid byte
+                    End If
+                Else
+                    SendLinkNak(7)      'Request not supported
+                End If
+                Reset_state()
             Case &H17
                 ReceivedText(dispString, "Received Change Baud request")
-                sendToLog(dispString, "Received change baud request")
+                SendToLog(dispString, "Received change baud request")
                 pendingLinkAck = True  'Set the pendingLinkAck to true
                 SendLinkAck()
                 If forceNak = True Then
-                    reset_state()
+                    Reset_state()
                 Else
                     SerialPort1.Close()             'Close our Serial Port
                     Select Case receiveBuffer(5)
@@ -4374,12 +4940,12 @@ Public Class FrmMain
                 End If
             Case &H18               'This is a request for maximunm payload size
                 ReceivedText(dispString, "Query Max Payload Size received")
-                sendToLog(dispString, "Query Max Payload Size received")
+                SendToLog(dispString, "Query Max Payload Size received")
                 SendLinkAck()
                 If forceNak = True Then
-                    reset_state()
+                    Reset_state()
                 Else
-                    pauseMS(tARValBox.Value)      'Wait 100ms before sending response
+                    PauseMS(tARValBox.Value)      'Wait 100ms before sending response
                     xmitBuffer(0) = 8
                     xmitBuffer(1) = 3
                     xmitBuffer(2) = 0
@@ -4392,10 +4958,10 @@ Public Class FrmMain
                 End If
             Case &H19               'This is a response for maximunm payload size request
                 ReceivedText(dispString, "Max Payload Size response received: 0x" & Conversion.Hex(receiveBuffer(5)))
-                sendToLog(dispString, "Max Payload Size response received: 0x" & Conversion.Hex(receiveBuffer(5)))
+                SendToLog(dispString, "Max Payload Size response received: 0x" & Conversion.Hex(receiveBuffer(5)))
                 SendLinkAck()
                 If forceNak = True Then
-                    reset_state()
+                    Reset_state()
                 Else
                     'MaxPayloadCd = receiveBuffer(5)
                     Select Case receiveBuffer(5)
@@ -4502,7 +5068,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub pauseMS(pauseTimeMS As Integer)
+    Private Sub PauseMS(pauseTimeMS As Integer)
         Dim startTime As System.DateTime
         Dim rightNowTime As System.DateTime
         Dim deltaTime As System.TimeSpan
@@ -4520,25 +5086,25 @@ Public Class FrmMain
     End Sub
 
     'Processes Type Supported Queries
-    Private Sub processTypeSupportedQuery()
+    Private Sub ProcessTypeSupportedQuery()
 
         Dim xmitBuffer(6) As Byte
         Dim dispString As String
 
-        If verifyChecksum(receiveBuffer, (receiveIndex - 2)) = False Then
+        If VerifyChecksum(receiveBuffer, (receiveIndex - 2)) = False Then
             dispString = ByteToHexString(receiveBuffer, "Recv", receiveIndex)    'Display the received data in the text box
-            sendToLog(dispString, "Invalid Checksum Received")
+            SendToLog(dispString, "Invalid Checksum Received")
             ReceivedText(dispString, "Invalid Checksum Received")
-            sendLinkNak(3)
+            SendLinkNak(3)
         Else
             If CheckSupported(receiveBuffer(0), receiveBuffer(1)) = True Then
                 SendLinkAck()
             Else
                 'Send NAK
-                sendLinkNak(6)
+                SendLinkNak(6)
             End If
         End If
-        reset_state()
+        Reset_state()
 
     End Sub
 
@@ -4547,7 +5113,7 @@ Public Class FrmMain
         Dim xmitBuffer(8) As Byte
         Dim rtnval As Integer
 
-        pauseMS(tARValBox.Value)      'Wait before sending response
+        PauseMS(tARValBox.Value)      'Wait before sending response
         xmitBuffer(0) = 8
         xmitBuffer(1) = 1
         xmitBuffer(2) = 0
@@ -4556,11 +5122,11 @@ Public Class FrmMain
         xmitBuffer(5) = basicID
         'pendingLinkAck = True  'Set the pendingLinkAck to true
         SendComData(xmitBuffer, 6, textStr, pendingLinkAck)
-        rtnval = getLinkAck()
+        rtnval = GetLinkAck()
     End Sub
 
     'Processes Incoming Basic DR Application Messages
-    Private Sub processBasicDRAppMsg(ByVal dispString As String)
+    Private Sub ProcessBasicDRAppMsg(ByVal dispString As String)
 
         Dim xmitBuffer(8) As Byte
         Dim powerLevel As Single
@@ -4579,11 +5145,11 @@ Public Class FrmMain
             Exit Sub
         End If
 
-        If verifyChecksum(receiveBuffer, (receiveIndex - 2)) = False Then
+        If VerifyChecksum(receiveBuffer, (receiveIndex - 2)) = False Then
             dispString = ByteToHexString(receiveBuffer, "Recv", receiveIndex)    'Display the received data in the text box
-            sendToLog(dispString, "Received Invalid Checksum")
+            SendToLog(dispString, "Received Invalid Checksum")
             ReceivedText(dispString, "Received Invalid Checksum")
-            sendLinkNak(3)
+            SendLinkNak(3)
         Else        'Checksum is valid so see what the message is
             'reset Baud default timeout
             If tmrBaudDefault.Enabled = True Then   'Valid communication established--reset baud timer if it is already running
@@ -4593,108 +5159,197 @@ Public Class FrmMain
             If rbMode1.Checked = True Then
                 'This is a UCM - controller device
                 Select Case receiveBuffer(4)
+                    Case &H3        'Received Application ACK
+                        If pendingAck <> receiveBuffer(5) Then
+                            ReceivedText("", "Invalid Ack OpCode returned " & receiveBuffer(5))
+                        End If
+                        ReceivedText(dispString, "Recieved an Application Ack with code: " & Hex(receiveBuffer(5)))
+                        SendToLog(dispString, "Recieved an Application Ack with code: " & Hex(receiveBuffer(5)))
+                        SendLinkAck()
+                        Reset_state()
+                    Case &H4        'Received Application NAK
+                        Select Case receiveBuffer(5)
+                            Case 0
+                                ReceivedText(dispString, "Application NAK returned with reason: 0 -No Reason Specified")
+                                SendToLog(dispString, "Application NAK returned with reason: 0 -No Reason Specified")
+                            Case 1
+                                ReceivedText(dispString, "Application NAK returned with reason: 1 -Opcode 1 not supported")
+                                SendToLog(dispString, "Application NAK returned with reason: 1 -Opcode 1 not supported")
+                            Case 2
+                                ReceivedText(dispString, "Application NAK returned with reason: 2 -Opcode 2 invalid")
+                                SendToLog(dispString, "Application NAK returned with reason: 2 -Opcode 2 invalid")
+                            Case 3
+                                ReceivedText(dispString, "Application NAK returned with reason: 3 -Busy")
+                                SendToLog(dispString, "Application NAK returned with reason: 3 -Busy")
+                            Case 4
+                                ReceivedText(dispString, "Application NAK returned with reason: 4 -Length Invalid")
+                                SendToLog(dispString, "Application NAK returned with reason: 4 -Length Invalid")
+                            Case 5
+                                ReceivedText(dispString, "Application NAK returned with reason: 5 -Customer Override is in effect")
+                                SendToLog(dispString, "Application NAK returned with reason: 5 -Customer Override is in effect")
+                        End Select
+                        SendLinkAck()
                     Case &H11       'Customer override received
                         If receiveBuffer(5) = 1 Then
                             ReceivedText(dispString, "Received from SGD: Customer Override in Effect")
-                            sendToLog(dispString, "Received from SGD: Customer Override in Effect")
+                            SendToLog(dispString, "Received from SGD: Customer Override in Effect")
                             ucmCustomerOverride = True
+                            If chkCustOverride.Checked <> True Then
+                                ignoreOverrideChange = True
+                                chkCustOverride.Checked = True
+                            End If
                         Else
                             ReceivedText(dispString, "Received from SGD: Customer Override no longer in Effect")
-                            sendToLog(dispString, "Received from SGD: Customer Override no longer in Effect")
+                            SendToLog(dispString, "Received from SGD: Customer Override no longer in Effect")
                             ucmCustomerOverride = False
+                            If chkCustOverride.Checked <> False Then
+                                ignoreOverrideChange = True
+                                chkCustOverride.Checked = False
+                            End If
                         End If
                         receiveIndex = 0
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             SendAppAck(&H11, "Sent Application Ack of command type: 0x11")
                         End If
-                    Case &H14       'Sleep
-                        ReceivedText(dispString, "SGD is Idle")
-                        sendToLog(dispString, "SGD is Idle")
+                    Case &H13       'Unsolicited state query response received
+                        DetermineOpState(dispString)
+                        ReceivedText(dispString, "Received operating state from SGD")
+                        SendToLog(dispString, "Received operating state from SGD")
                         receiveIndex = 0
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
+                        Else
+                            SendAppAck(&H13, "Sent Application Ack of command type: 0x13")
+                        End If
+                    Case &H14       'Sleep
+                        ReceivedText(dispString, "SGD is Idle")
+                        SendToLog(dispString, "SGD is Idle")
+                        receiveIndex = 0
+                        SendLinkAck()
+                        If forceNak = True Then
+                            Reset_state()
                         Else
                             SendAppAck(&H14, "Sent Application Ack of command type: 0x14")
                         End If
 
                     Case &H15
                         ReceivedText(dispString, "SGD is Awake")
-                        sendToLog(dispString, "SGD is Awake")
+                        SendToLog(dispString, "SGD is Awake")
                         receiveIndex = 0
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
                             SendAppAck(&H15, "Sent Application Ack of command type: 0x15")
                         End If
 
+                    Case &H1A        'Reboot command received
+                        ReceivedText(dispString, "Reboot command received. Opcode2 = " & receiveBuffer(5))
+                        SendToLog(dispString, "Reboot command received. Opcode2 = " & receiveBuffer(5))
+                        receiveIndex = 0
+                        SendLinkAck()
+                        If forceNak = True Then
+                            Reset_state()
+                        Else
+                            SendAppAck(&H1A, "Sent Application Ack of command type: 0x1A")
+                        End If
+
                     Case Else
                         ReceivedText(dispString, "Invalid Opcode Received: " & receiveBuffer(4))
-                        sendToLog(dispString, "Invalid Opcode Received: " & receiveBuffer(4))
-                        sendLinkNak(7)
+                        SendToLog(dispString, "Invalid Opcode Received: " & receiveBuffer(4))
+                        SendLinkNak(7)
                 End Select
             Else
                 'This is a SGD - Appliance
                 Select Case receiveBuffer(4)
                     Case &H1        'Shed Load command received
-                        ReceivedText(dispString, "Shed Load command received. Duration = " & byteToDurationStr(receiveBuffer(5)))
-                        sendToLog(dispString, "Shed Load command received. Duration = " & byteToDurationStr(receiveBuffer(5)))
+                        ReceivedText(dispString, "Shed Load command received. Duration = " & ByteToDurationStr(receiveBuffer(5)))
+                        SendToLog(dispString, "Shed Load command received. Duration = " & ByteToDurationStr(receiveBuffer(5)))
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            pauseMS(tARValBox.Value)      'Wait before sending response
-                            tempByte = receiveBuffer(5)
-                            xmitBuffer(0) = 8
-                            xmitBuffer(1) = 1
-                            xmitBuffer(2) = 0
-                            xmitBuffer(3) = 2
-                            xmitBuffer(4) = 3
-                            xmitBuffer(5) = 1
-                            pendingAck = 0  'Set the pendingAck to nothing
-                            pendingLinkAck = True  'Set the pendingLinkAck to true
-                            SendComData(xmitBuffer, 6, "Sent Application Ack of command type: 0x1", pendingLinkAck)
-                            If overRideSet = True Then sendOverridePend = True
-                            If cbResponseSim.Checked = True Then
-                                preShedOpState = OpStateBox.SelectedIndex 'Remembers old opstate
-                                'Set new state
-                                Select Case realSGDShedResponse.SelectedIndex
-                                    Case 0
-                                        'Set to manual so do nothing
-                                    Case 1
-                                        If chkCustOverride.Checked = False Then
-                                            OpStateBox.SelectedIndex = 2
+                            PauseMS(tARValBox.Value)      'Wait before sending response
+                            If chkSendNakOverride.Checked = True And overRideSet = True Then
+                                tempByte = receiveBuffer(5)
+                                xmitBuffer(0) = 8
+                                xmitBuffer(1) = 1
+                                xmitBuffer(2) = 0
+                                xmitBuffer(3) = 2
+                                xmitBuffer(4) = 4
+                                xmitBuffer(5) = 5
+                                pendingAck = 0  'Set the pendingAck to nothing
+                                pendingLinkAck = True  'Set the pendingLinkAck to true
+                                SendComData(xmitBuffer, 6, "Sent Application Nak with code: 0x5", pendingLinkAck)
+                            Else
+                                tempByte = receiveBuffer(5)
+                                xmitBuffer(0) = 8
+                                xmitBuffer(1) = 1
+                                xmitBuffer(2) = 0
+                                xmitBuffer(3) = 2
+                                xmitBuffer(4) = 3
+                                xmitBuffer(5) = 1
+                                pendingAck = 0  'Set the pendingAck to nothing
+                                pendingLinkAck = True  'Set the pendingLinkAck to true
+                                SendComData(xmitBuffer, 6, "Sent Application Ack of command type: 0x1", pendingLinkAck)
+                                If overRideSet = True Then
+                                    sendOverridePend = True
+                                Else
+                                    gridMode = "Shed"
+                                    If cbResponseSim.Checked = True Then
+                                        nudRunningPower.Value = nudRunShedPwr.Value
+                                        preShedOpState = OpStateBox.SelectedIndex 'Remembers old opstate
+                                        If bRealDeviceRun.Text = "Stop" Then
+                                            If (cbHVAC.Checked = True Or cbHotWater.Checked = True) And nudPresentCapacity.Value >= nudShedStart.Value Then
+                                                commodityArray(0).instRate = nudRunningPower.Value
+                                                OpStateBox.SelectedIndex = 2
+                                            Else
+                                                commodityArray(0).instRate = 0
+                                                OpStateBox.SelectedIndex = 4
+                                            End If
                                         Else
-                                            OpStateBox.SelectedIndex = 1
+                                            'Set new state
+                                            Select Case realSGDShedResponse.SelectedIndex
+                                                Case 0
+                                                'Set to manual so do nothing
+                                                'Set to manual so do nothing
+                                                Case 1
+                                                    If chkCustOverride.Checked = False Then
+                                                        OpStateBox.SelectedIndex = 2
+                                                    Else
+                                                        OpStateBox.SelectedIndex = 1
+                                                    End If
+                                                Case 2
+                                                    If chkCustOverride.Checked = False Then
+                                                        OpStateBox.SelectedIndex = 4
+                                                    Else
+                                                        OpStateBox.SelectedIndex = 0
+                                                    End If
+                                                Case 3
+                                                    OpStateBox.SelectedIndex = 5
+                                            End Select
+                                            'If a timer is supported, set timer to countdown
+                                            If internalClockSupportedcb.Checked = True And receiveBuffer(5) <> 0 And receiveBuffer(5) <> &HFF Then
+                                                shedEventTime = (receiveBuffer(5) * receiveBuffer(5)) * 2
+                                                shedEventTimer.Enabled = True
+                                            End If
                                         End If
-                                    Case 2
-                                        If chkCustOverride.Checked = False Then
-                                            OpStateBox.SelectedIndex = 4
-                                        Else
-                                            OpStateBox.SelectedIndex = 0
-                                        End If
-                                    Case 3
-                                        OpStateBox.SelectedIndex = 5
-                                End Select
-                                'If a timer is supported, set timer to countdown
-                                If internalClockSupportedcb.Checked = True And receiveBuffer(5) <> 0 And receiveBuffer(5) <> &HFF Then
-                                    shedEventTime = (receiveBuffer(5) * receiveBuffer(5)) * 2
-                                    shedEventTimer.Enabled = True
+                                    End If
                                 End If
                             End If
                         End If
                     Case &H2        'End Shed/Run Normal
                         ReceivedText(dispString, "Received End Shed/Run Normal Command")
-                        sendToLog(dispString, "Received End Shed/Run Normal Command")
+                        SendToLog(dispString, "Received End Shed/Run Normal Command")
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            pauseMS(tARValBox.Value)      'Wait before sending response
+                            PauseMS(tARValBox.Value)      'Wait before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 1
                             xmitBuffer(2) = 0
@@ -4710,22 +5365,51 @@ Public Class FrmMain
                                 xmitBuffer(5) = 2
                                 SendComData(xmitBuffer, 6, "Sent Application Ack of command type: 0x2", pendingLinkAck)
                             End If
+                            gridMode = "Normal"
                             If cbResponseSim.Checked = True Then
-                                'Set new state
-                                Select Case realSGDEndShedResponse.SelectedIndex
-                                    Case 0
+                                nudRunningPower.Value = nudRunNormPwr.Value
+                                If bRealDeviceRun.Text = "Stop" Then
+                                    If cbPoolPump.Checked = True Then
+                                        If nudPPRunMin.Value > 0 Then
+                                            If nudStartDelay.Value <= 0 Then
+                                                commodityArray(0).instRate = nudRunningPower.Value
+                                                OpStateBox.SelectedIndex = 1
+                                            Else
+                                                commodityArray(0).instRate = 0
+                                                OpStateBox.SelectedIndex = 0
+                                            End If
+                                        Else
+                                            commodityArray(0).instRate = 0
+                                            OpStateBox.SelectedIndex = 0
+                                        End If
+                                    ElseIf cbHVAC.Checked = True Or cbHotWater.Checked = True Then
+                                        If (commodityArray(0).instRate > 0 Or (nudPresentCapacity.Value > nudNormalStart.Value)) Then
+                                            'Start running normal
+                                            commodityArray(0).instRate = nudRunningPower.Value
+                                            OpStateBox.SelectedIndex = 1
+                                        Else
+                                            'Set to idle normal
+                                            commodityArray(0).instRate = 0
+                                            OpStateBox.SelectedIndex = 0
+                                        End If
+                                    End If
+                                Else
+                                    'Set new state
+                                    Select Case realSGDEndShedResponse.SelectedIndex
+                                        Case 0
                                         'Set to manual so do nothing
-                                    Case 1
-                                        OpStateBox.SelectedIndex = 1
-                                    Case 2
-                                        OpStateBox.SelectedIndex = 0
-                                    Case 3
-                                        OpStateBox.SelectedIndex = preShedOpState
-                                    Case 4
-                                        OpStateBox.SelectedIndex = 5
-                                End Select
-                                'Shuts off timer
-                                shedEventTimer.Enabled = False
+                                        Case 1
+                                            OpStateBox.SelectedIndex = 1
+                                        Case 2
+                                            OpStateBox.SelectedIndex = 0
+                                        Case 3
+                                            OpStateBox.SelectedIndex = preShedOpState
+                                        Case 4
+                                            OpStateBox.SelectedIndex = 5
+                                    End Select
+                                    'Shuts off timer
+                                    shedEventTimer.Enabled = False
+                                End If
                             End If
                         End If
                     Case &H3        'Received Application ACK
@@ -4733,43 +5417,46 @@ Public Class FrmMain
                             ReceivedText("", "Invalid Ack OpCode returned " & receiveBuffer(5))
                         End If
                         ReceivedText(dispString, "Recieved an Application Ack with code: " & Hex(receiveBuffer(5)))
-                        sendToLog(dispString, "Recieved an Application Ack with code: " & Hex(receiveBuffer(5)))
+                        SendToLog(dispString, "Recieved an Application Ack with code: " & Hex(receiveBuffer(5)))
                         SendLinkAck()
-                        reset_state()
+                        Reset_state()
                     Case &H4        'Received Application NAK
                         Select Case receiveBuffer(5)
                             Case 0
                                 ReceivedText(dispString, "Application NAK returned with reason: 0 -No Reason Specified")
-                                sendToLog(dispString, "Application NAK returned with reason: 0 -No Reason Specified")
+                                SendToLog(dispString, "Application NAK returned with reason: 0 -No Reason Specified")
                             Case 1
                                 ReceivedText(dispString, "Application NAK returned with reason: 1 -Opcode 1 not supported")
-                                sendToLog(dispString, "Application NAK returned with reason: 1 -Opcode 1 not supported")
+                                SendToLog(dispString, "Application NAK returned with reason: 1 -Opcode 1 not supported")
                             Case 2
                                 ReceivedText(dispString, "Application NAK returned with reason: 2 -Opcode 2 invalid")
-                                sendToLog(dispString, "Application NAK returned with reason: 2 -Opcode 2 invalid")
+                                SendToLog(dispString, "Application NAK returned with reason: 2 -Opcode 2 invalid")
                             Case 3
                                 ReceivedText(dispString, "Application NAK returned with reason: 3 -Busy")
-                                sendToLog(dispString, "Application NAK returned with reason: 3 -Busy")
+                                SendToLog(dispString, "Application NAK returned with reason: 3 -Busy")
                             Case 4
                                 ReceivedText(dispString, "Application NAK returned with reason: 4 -Length Invalid")
-                                sendToLog(dispString, "Application NAK returned with reason: 4 -Length Invalid")
+                                SendToLog(dispString, "Application NAK returned with reason: 4 -Length Invalid")
+                            Case 5
+                                ReceivedText(dispString, "Application NAK returned with reason: 5 -Customer Override is in effect")
+                                SendToLog(dispString, "Application NAK returned with reason: 5 -Customer Override is in effect")
                         End Select
                         SendLinkAck()
                     Case &H6        'Request for power level
                         If receiveBuffer(5) < 128 Then
                             powerLevel = receiveBuffer(5) * 100.0 / 127.0
                             ReceivedText(dispString, "Recieved Power Level Request: Level Set - Absorbed = " & powerLevel.ToString("0.00"))
-                            sendToLog(dispString, "Recieved Power Level Request: Level Set - Absorbed = " & powerLevel.ToString("0.00"))
+                            SendToLog(dispString, "Recieved Power Level Request: Level Set - Absorbed = " & powerLevel.ToString("0.00"))
                         Else
                             powerLevel = (receiveBuffer(5) - 128) * 100.0 / 127.0
                             ReceivedText(dispString, "Recieved Power Level Request: Level Set - Produced = " & powerLevel.ToString("0.00"))
-                            sendToLog(dispString, "Recieved Power Level Request: Level Set - Produced = " & powerLevel.ToString("0.00"))
+                            SendToLog(dispString, "Recieved Power Level Request: Level Set - Produced = " & powerLevel.ToString("0.00"))
                         End If
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            pauseMS(tARValBox.Value)      'Wait before sending response
+                            PauseMS(tARValBox.Value)      'Wait before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 1
                             xmitBuffer(2) = 0
@@ -4789,19 +5476,19 @@ Public Class FrmMain
                     Case &H7        'Present Relative Price received
                         If receiveBuffer(5) = 0 Then
                             ReceivedText(dispString, "Received Present Relative Price: unknown")
-                            sendToLog(dispString, "Received Present Relative Price: unknown")
+                            SendToLog(dispString, "Received Present Relative Price: unknown")
                         ElseIf receiveBuffer(5) = &HFF Then
                             ReceivedText(dispString, "Received Present Relative Price: too large to fit")
-                            sendToLog(dispString, "Received Present Relative Price: too large to fit")
+                            SendToLog(dispString, "Received Present Relative Price: too large to fit")
                         Else
-                            ReceivedText(dispString, "Received Present Relative Price: " & byteToRelativePrice(receiveBuffer(5)))
-                            sendToLog(dispString, "Received Present Relative Price: " & byteToRelativePrice(receiveBuffer(5)))
+                            ReceivedText(dispString, "Received Present Relative Price: " & ByteToRelativePrice(receiveBuffer(5)))
+                            SendToLog(dispString, "Received Present Relative Price: " & ByteToRelativePrice(receiveBuffer(5)))
                         End If
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            pauseMS(tARValBox.Value)      'Wait before sending response
+                            PauseMS(tARValBox.Value)      'Wait before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 1
                             xmitBuffer(2) = 0
@@ -4821,19 +5508,19 @@ Public Class FrmMain
                     Case &H8        'Next Period Relative Price received
                         If receiveBuffer(5) = 0 Then
                             ReceivedText(dispString, "Received Next Period Relative Price: unknown")
-                            sendToLog(dispString, "Received Next Period Relative Price: unknown")
+                            SendToLog(dispString, "Received Next Period Relative Price: unknown")
                         ElseIf receiveBuffer(5) = &HFF Then
                             ReceivedText(dispString, "Received Next Period Relative Price: too large to fit")
-                            sendToLog(dispString, "Received Next Period Relative Price: too large to fit")
+                            SendToLog(dispString, "Received Next Period Relative Price: too large to fit")
                         Else
-                            ReceivedText(dispString, "Received Next Period Relative Price: " & byteToRelativePrice(receiveBuffer(5)))
-                            sendToLog(dispString, "Received Next Period Relative Price: " & byteToRelativePrice(receiveBuffer(5)))
+                            ReceivedText(dispString, "Received Next Period Relative Price: " & ByteToRelativePrice(receiveBuffer(5)))
+                            SendToLog(dispString, "Received Next Period Relative Price: " & ByteToRelativePrice(receiveBuffer(5)))
                         End If
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            pauseMS(tARValBox.Value)      'Wait before sending response
+                            PauseMS(tARValBox.Value)      'Wait before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 1
                             xmitBuffer(2) = 0
@@ -4851,13 +5538,13 @@ Public Class FrmMain
                             End If
                         End If
                     Case &H9        'Time remaining in Present Price Period received
-                        ReceivedText(dispString, "Received Time Remaining in Present Period: " & byteToDurationStr(receiveBuffer(5)))
-                        sendToLog(dispString, "Received Time Remaining in Present Period: " & byteToDurationStr(receiveBuffer(5)))
+                        ReceivedText(dispString, "Received Time Remaining in Present Period: " & ByteToDurationStr(receiveBuffer(5)))
+                        SendToLog(dispString, "Received Time Remaining in Present Period: " & ByteToDurationStr(receiveBuffer(5)))
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            pauseMS(tARValBox.Value)      'Wait before sending response
+                            PauseMS(tARValBox.Value)      'Wait before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 1
                             xmitBuffer(2) = 0
@@ -4875,15 +5562,27 @@ Public Class FrmMain
                             End If
                         End If
                     Case &HA        'Critical Peak
-                            ReceivedText(dispString, "Critical Peak Event received. Duration: " & byteToDurationStr(receiveBuffer(5)))
-                            sendToLog(dispString, "Critical Peak Event received. Duration: " & byteToDurationStr(receiveBuffer(5)))
-                            SendLinkAck()
-                            If forceNak = True Then
-                                reset_state()
+                        ReceivedText(dispString, "Critical Peak Event received. Duration: " & ByteToDurationStr(receiveBuffer(5)))
+                        SendToLog(dispString, "Critical Peak Event received. Duration: " & ByteToDurationStr(receiveBuffer(5)))
+                        SendLinkAck()
+                        If forceNak = True Then
+                            Reset_state()
+                        Else
+                            PauseMS(tARValBox.Value)      'Wait before sending response
+                            If chkSendNakOverride.Checked = True And overRideSet = True Then
+                                tempByte = receiveBuffer(5)
+                                xmitBuffer(0) = 8
+                                xmitBuffer(1) = 1
+                                xmitBuffer(2) = 0
+                                xmitBuffer(3) = 2
+                                xmitBuffer(4) = 4
+                                xmitBuffer(5) = 5
+                                pendingAck = 0  'Set the pendingAck to nothing
+                                pendingLinkAck = True  'Set the pendingLinkAck to true
+                                SendComData(xmitBuffer, 6, "Sent Application Nak with code: 0x5", pendingLinkAck)
                             Else
-                                pauseMS(tARValBox.Value)      'Wait before sending response
-                            xmitBuffer(0) = 8
-                            xmitBuffer(1) = 1
+                                xmitBuffer(0) = 8
+                                xmitBuffer(1) = 1
                                 xmitBuffer(2) = 0
                                 xmitBuffer(3) = 2
                                 xmitBuffer(4) = 3
@@ -4891,103 +5590,146 @@ Public Class FrmMain
                                 pendingAck = 0  'Set the pendingAck to nothing
                                 pendingLinkAck = True  'Set the pendingLinkAck to true
                                 SendComData(xmitBuffer, 6, "Sent Application Ack of command type: 0xA", pendingLinkAck)
-                            If overRideSet = True Then sendOverridePend = True
-                            If cbResponseSim.Checked = True Then
-                                    preShedOpState = OpStateBox.SelectedIndex 'Remembers old opstate
-                                    'Set new state
-                                    Select Case realSGDCritPeakResponse.SelectedIndex
-                                        Case 0
-                                            'Set to manual so do nothing
-                                        Case 1
-                                            'Not supported, send application level Nak
-                                            sendMsgNotSupportedNak()
-                                        Case 2
-                                            If chkCustOverride.Checked = False Then
-                                                OpStateBox.SelectedIndex = 2
-                                            Else
-                                                OpStateBox.SelectedIndex = 1
-                                            End If
-                                        Case 3
-                                            If chkCustOverride.Checked = False Then
+                                If overRideSet = True Then
+                                    sendOverridePend = True
+                                Else
+                                    gridMode = "CPP"
+                                    If cbResponseSim.Checked = True Then
+                                        nudRunningPower.Value = nudRunCppPwr.Value
+                                        preShedOpState = OpStateBox.SelectedIndex 'Remembers old opstate
+                                        If bRealDeviceRun.Text = "Stop" Then    'Simulation is running
+                                            If cbPoolPump.Checked = True Then
+                                                commodityArray(0).instRate = 0
                                                 OpStateBox.SelectedIndex = 4
-                                            Else
-                                                OpStateBox.SelectedIndex = 0
+                                            ElseIf cbHVAC.Checked = True Or cbHotWater.Checked = True Then
+                                                If nudPresentCapacity.Value < nudCPPStart.Value Then
+                                                    commodityArray(0).instRate = 0
+                                                    OpStateBox.SelectedIndex = 4
+                                                ElseIf commodityArray(0).instRate <> 0 Then
+                                                    commodityArray(0).instRate = nudRunningPower.Value
+                                                End If
                                             End If
-                                        Case 4
-                                            OpStateBox.SelectedIndex = 5
-                                    End Select
-                                    'If a timer is supported, set timer to countdown
-                                    If internalClockSupportedcb.Checked = True And receiveBuffer(5) <> 0 And receiveBuffer(5) <> &HFF Then
-                                        shedEventTime = (receiveBuffer(5) * receiveBuffer(5)) * 2
-                                        shedEventTimer.Enabled = True
+                                        Else
+                                            'Set new state
+                                            Select Case realSGDCritPeakResponse.SelectedIndex
+                                                Case 0
+                                            'Set to manual so do nothing
+                                                Case 1
+                                                    'Not supported, send application level Nak
+                                                    SendMsgNotSupportedNak()
+                                                Case 2
+                                                    If chkCustOverride.Checked = False Then
+                                                        OpStateBox.SelectedIndex = 2
+                                                    Else
+                                                        OpStateBox.SelectedIndex = 1
+                                                    End If
+                                                Case 3
+                                                    If chkCustOverride.Checked = False Then
+                                                        OpStateBox.SelectedIndex = 4
+                                                    Else
+                                                        OpStateBox.SelectedIndex = 0
+                                                    End If
+                                                Case 4
+                                                    OpStateBox.SelectedIndex = 5
+                                            End Select
+                                            'If a timer is supported, set timer to countdown
+                                            If internalClockSupportedcb.Checked = True And receiveBuffer(5) <> 0 And receiveBuffer(5) <> &HFF Then
+                                                shedEventTime = (receiveBuffer(5) * receiveBuffer(5)) * 2
+                                                shedEventTimer.Enabled = True
+                                            End If
+                                        End If
                                     End If
                                 End If
                             End If
+                        End If
+
                     Case &HB        'Grid Emergency
-                        ReceivedText(dispString, "Grid Emergency received. Duration: " & byteToDurationStr(receiveBuffer(5)))
-                        sendToLog(dispString, "Grid Emergency received. Duration: " & byteToDurationStr(receiveBuffer(5)))
+                        ReceivedText(dispString, "Grid Emergency received. Duration: " & ByteToDurationStr(receiveBuffer(5)))
+                        SendToLog(dispString, "Grid Emergency received. Duration: " & ByteToDurationStr(receiveBuffer(5)))
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            pauseMS(tARValBox.Value)      'Wait before sending response
-                            xmitBuffer(0) = 8
-                            xmitBuffer(1) = 1
-                            xmitBuffer(2) = 0
-                            xmitBuffer(3) = 2
-                            pendingAck = 0  'Set the pendingAck to nothing
-                            pendingLinkAck = True  'Set the pendingLinkAck to true
-                            If cbAppNakMsg.Checked = True Then
-                                xmitBuffer(4) = 4       'Send a Nak instead
-                                xmitBuffer(5) = nudAppNakRtn.Value
-                                SendComData(xmitBuffer, 6, "Sent Application Nak", pendingLinkAck)
+                            PauseMS(tARValBox.Value)      'Wait before sending response
+                            If chkSendNakOverride.Checked = True And overRideSet = True Then
+                                tempByte = receiveBuffer(5)
+                                xmitBuffer(0) = 8
+                                xmitBuffer(1) = 1
+                                xmitBuffer(2) = 0
+                                xmitBuffer(3) = 2
+                                xmitBuffer(4) = 4
+                                xmitBuffer(5) = 5
+                                pendingAck = 0  'Set the pendingAck to nothing
+                                pendingLinkAck = True  'Set the pendingLinkAck to true
+                                SendComData(xmitBuffer, 6, "Sent Application Nak with code: 0x5", pendingLinkAck)
                             Else
-                                xmitBuffer(4) = 3
-                                xmitBuffer(5) = &HB
-                                SendComData(xmitBuffer, 6, "Sent Application Ack of command type: 0x0B", pendingLinkAck)
-                            End If
-                            If cbResponseSim.Checked = True Then
-                                preShedOpState = OpStateBox.SelectedIndex 'Remembers old opstate
-                                'Set new state
-                                Select Case realSGDEmergencyResponse.SelectedIndex
-                                    Case 0
+                                xmitBuffer(0) = 8
+                                xmitBuffer(1) = 1
+                                xmitBuffer(2) = 0
+                                xmitBuffer(3) = 2
+                                pendingAck = 0  'Set the pendingAck to nothing
+                                pendingLinkAck = True  'Set the pendingLinkAck to true
+                                If cbAppNakMsg.Checked = True Then
+                                    xmitBuffer(4) = 4       'Send a Nak instead
+                                    xmitBuffer(5) = nudAppNakRtn.Value
+                                    SendComData(xmitBuffer, 6, "Sent Application Nak", pendingLinkAck)
+                                Else
+                                    xmitBuffer(4) = 3
+                                    xmitBuffer(5) = &HB
+                                    SendComData(xmitBuffer, 6, "Sent Application Ack of command type: 0x0B", pendingLinkAck)
+                                End If
+                                gridMode = "Emergency"
+                                If cbResponseSim.Checked = True Then
+                                    preShedOpState = OpStateBox.SelectedIndex 'Remembers old opstate
+                                    If bRealDeviceRun.Text = "Stop" Then    'Simulation is running
+                                        'In grid emergency shut down no matter what
+                                        commodityArray(0).instRate = 0
+                                        OpStateBox.SelectedIndex = 4
+                                    Else
+                                        'Set new state
+                                        Select Case realSGDEmergencyResponse.SelectedIndex
+                                            Case 0
                                         'Set to manual so do nothing
-                                    Case 1
-                                        'Not supported, send application level Nak
-                                        sendMsgNotSupportedNak()
-                                    Case 2
-                                        If chkCustOverride.Checked = False Then
-                                            OpStateBox.SelectedIndex = 2
-                                        Else
-                                            OpStateBox.SelectedIndex = 1
+                                            Case 1
+                                                'Not supported, send application level Nak
+                                                SendMsgNotSupportedNak()
+                                            Case 2
+                                                If chkCustOverride.Checked = False Then
+                                                    OpStateBox.SelectedIndex = 2
+                                                Else
+                                                    OpStateBox.SelectedIndex = 1
+                                                End If
+                                            Case 3
+                                                If chkCustOverride.Checked = False Then
+                                                    OpStateBox.SelectedIndex = 4
+                                                Else
+                                                    OpStateBox.SelectedIndex = 0
+                                                End If
+                                            Case 4
+                                                OpStateBox.SelectedIndex = 5
+                                        End Select
+                                        'If a timer is supported, set timer to countdown
+                                        If internalClockSupportedcb.Checked = True And receiveBuffer(5) <> 0 And receiveBuffer(5) <> &HFF Then
+                                            shedEventTime = (receiveBuffer(5) * receiveBuffer(5)) * 2
+                                            shedEventTimer.Enabled = True
                                         End If
-                                    Case 3
-                                        If chkCustOverride.Checked = False Then
-                                            OpStateBox.SelectedIndex = 4
-                                        Else
-                                            OpStateBox.SelectedIndex = 0
-                                        End If
-                                    Case 4
-                                        OpStateBox.SelectedIndex = 5
-                                End Select
-                                'If a timer is supported, set timer to countdown
-                                If internalClockSupportedcb.Checked = True And receiveBuffer(5) <> 0 And receiveBuffer(5) <> &HFF Then
-                                    shedEventTime = (receiveBuffer(5) * receiveBuffer(5)) * 2
-                                    shedEventTimer.Enabled = True
+                                    End If
                                 End If
                             End If
+
                         End If
+
                     Case &HC        'Grid Guidance received
                         If cbVerboseLog.Checked = True Then
-                            processGridGuidance(receiveBuffer(5), 1, dispString)
+                            ProcessGridGuidance(receiveBuffer(5), 1, dispString)
                         Else
-                            processGridGuidance(receiveBuffer(5), 0, dispString)
+                            ProcessGridGuidance(receiveBuffer(5), 0, dispString)
                         End If
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            pauseMS(tARValBox.Value)      'Wait before sending response
+                            PauseMS(tARValBox.Value)      'Wait before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 1
                             xmitBuffer(2) = 0
@@ -5006,15 +5748,15 @@ Public Class FrmMain
                         End If
                     Case &HE        'Outside comm Connection Status received
                         ReceivedText(dispString, "Comm Status received: " & commStatusText(receiveBuffer(5)))
-                        sendToLog(dispString, "Comm Status received: " & commStatusText(receiveBuffer(5)))
+                        SendToLog(dispString, "Comm Status received: " & commStatusText(receiveBuffer(5)))
                         If cbResponseSim.Checked = True And internalClockSupportedcb.Checked = True And realSGDNoCommTimeoutEnabledbtn.Text = "Disable" Then
                             commStatusTimeoutTime = realSGDNoCommTimeoutValBox.Value
                         End If
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            pauseMS(tARValBox.Value)      'Wait before sending response
+                            PauseMS(tARValBox.Value)      'Wait before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 1
                             xmitBuffer(2) = 0
@@ -5031,14 +5773,39 @@ Public Class FrmMain
                                 SendComData(xmitBuffer, 6, "Sent Application Ack of command type: 0xE", pendingLinkAck)
                             End If
                         End If
-                    Case &H12       'Request for Operational State received
-                        ReceivedText(dispString, "Received Operational State Query")
-                        sendToLog(dispString, "Received Operational State Query")
+                    Case &H11       'Customer override received
+                        If receiveBuffer(5) = 1 Then
+                            ReceivedText(dispString, "Received from UCM: Customer Override in Effect")
+                            SendToLog(dispString, "Received from UCM: Customer Override in Effect")
+                            ucmCustomerOverride = True
+                            If chkCustOverride.Checked <> True Then
+                                ignoreOverrideChange = True
+                                chkCustOverride.Checked = True
+                            End If
+                        Else
+                            ReceivedText(dispString, "Received from UCM: Customer Override no longer in Effect")
+                            SendToLog(dispString, "Received from UCM: Customer Override no longer in Effect")
+                            ucmCustomerOverride = False
+                            If chkCustOverride.Checked <> False Then
+                                ignoreOverrideChange = True
+                                chkCustOverride.Checked = False
+                            End If
+                        End If
+                        receiveIndex = 0
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            pauseMS(tARValBox.Value)      'Wait before sending response
+                            SendAppAck(&H11, "Sent Application Ack of command type: 0x11")
+                        End If
+                    Case &H12       'Request for Operational State received
+                        ReceivedText(dispString, "Received Operational State Query")
+                        SendToLog(dispString, "Received Operational State Query")
+                        SendLinkAck()
+                        If forceNak = True Then
+                            Reset_state()
+                        Else
+                            PauseMS(tARValBox.Value)      'Wait before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 1
                             xmitBuffer(2) = 0
@@ -5057,12 +5824,12 @@ Public Class FrmMain
                         End If
                     Case &H16       'Simple Time Sync
                         ReceivedText(dispString, "Simple Time Sync received. Value = " & receiveBuffer(5))
-                        sendToLog(dispString, "Simple Time Sync received. Value = " & receiveBuffer(5))
+                        SendToLog(dispString, "Simple Time Sync received. Value = " & receiveBuffer(5))
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            pauseMS(tARValBox.Value)      'Wait before sending response
+                            PauseMS(tARValBox.Value)      'Wait before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 1
                             xmitBuffer(2) = 0
@@ -5080,56 +5847,157 @@ Public Class FrmMain
                             End If
                         End If
                     Case &H17       'Load Up command received
-                        ReceivedText(dispString, "Load Up command received. Duration = " & byteToDurationStr(receiveBuffer(5)))
-                        sendToLog(dispString, "Load Up command received. Duration = " & byteToDurationStr(receiveBuffer(5)))
+                        ReceivedText(dispString, "Load Up command received. Duration = " & ByteToDurationStr(receiveBuffer(5)))
+                        SendToLog(dispString, "Load Up command received. Duration = " & ByteToDurationStr(receiveBuffer(5)))
                         SendLinkAck()
                         If forceNak = True Then
-                            reset_state()
+                            Reset_state()
                         Else
-                            pauseMS(tARValBox.Value)      'Wait before sending response
+                            PauseMS(tARValBox.Value)      'Wait before sending response
+                            If chkSendNakOverride.Checked = True And overRideSet = True Then
+                                tempByte = receiveBuffer(5)
+                                xmitBuffer(0) = 8
+                                xmitBuffer(1) = 1
+                                xmitBuffer(2) = 0
+                                xmitBuffer(3) = 2
+                                xmitBuffer(4) = 4
+                                xmitBuffer(5) = 5
+                                pendingAck = 0  'Set the pendingAck to nothing
+                                pendingLinkAck = True  'Set the pendingLinkAck to true
+                                SendComData(xmitBuffer, 6, "Sent Application Nak with code: 0x5", pendingLinkAck)
+                            Else
+                                xmitBuffer(0) = 8
+                                xmitBuffer(1) = 1
+                                xmitBuffer(2) = 0
+                                xmitBuffer(3) = 2
+                                pendingAck = 0  'Set the pendingAck to nothing
+                                pendingLinkAck = True  'Set the pendingLinkAck to true
+                                If cbAppNakMsg.Checked = True Then
+                                    xmitBuffer(4) = 4       'Send a Nak instead
+                                    xmitBuffer(5) = nudAppNakRtn.Value
+                                    SendComData(xmitBuffer, 6, "Sent Application Nak", pendingLinkAck)
+                                Else
+                                    xmitBuffer(4) = 3
+                                    xmitBuffer(5) = &H17
+                                    SendComData(xmitBuffer, 6, "Sent Application Ack of command type: 0x17", pendingLinkAck)
+                                End If
+                                gridMode = "Loadup"
+                                If overRideSet = True Then sendOverridePend = True
+                                preShedOpState = OpStateBox.SelectedIndex 'Remembers old opstate
+                                If cbResponseSim.Checked = True Then
+                                    nudRunningPower.Value = nudRunNormPwr.Value
+                                    If bRealDeviceRun.Text = "Stop" Then
+                                        If cbPoolPump.Checked = True Then
+                                            If nudPPRunMin.Value > 0 And nudStartDelay.Value <= 0 Then
+                                                'start pool pump
+                                                OpStateBox.SelectedIndex = 3        'running heightened
+                                                lbCommodityCode.SelectedIndex = 0
+                                                commodityArray(0).instRate = nudRunningPower.Value
+                                                commodityArray(6).cumAmount = nudTotalCapacity.Value / 60
+                                                commodityArray(7).cumAmount = nudPresentCapacity.Value / 60
+                                            Else
+                                                OpStateBox.SelectedIndex = 6        'idle heightened
+                                            End If
+                                        ElseIf cbHVAC.Checked = True Or cbHotWater.Checked = True Then
+                                            If nudPresentCapacity.Value >= nudRunningPower.Value Then
+                                                'Start running heightened
+                                                lbCommodityCode.SelectedIndex = 0
+                                                commodityArray(lbCommodityCode.SelectedIndex).instRate = nudRunningPower.Value
+                                                OpStateBox.SelectedIndex = 3
+                                            Else
+                                                'Set to idle heightened
+                                                lbCommodityCode.SelectedIndex = 0
+                                                commodityArray(lbCommodityCode.SelectedIndex).instRate = 0
+                                                OpStateBox.SelectedIndex = 6
+                                            End If
+                                        End If
+                                    Else
+                                        'Set new state
+                                        Select Case realSGDLoadUpResponse.SelectedIndex
+                                            Case 0
+                                        'Set to manual so do nothing
+                                            Case 1
+                                                'Not supported, send application level Nak
+                                                SendMsgNotSupportedNak()
+                                            Case 2
+                                                OpStateBox.SelectedIndex = 1
+                                            Case 3
+                                                OpStateBox.SelectedIndex = 0
+                                            Case 4
+                                                OpStateBox.SelectedIndex = 5
+                                        End Select
+                                    End If
+                                    'If a timer is supported, set timer to countdown
+                                    If internalClockSupportedcb.Checked = True And receiveBuffer(5) <> 0 And receiveBuffer(5) <> &HFF Then
+                                        shedEventTime = (receiveBuffer(5) * receiveBuffer(5)) * 2
+                                        shedEventTimer.Enabled = True
+                                    End If
+                                End If
+                            End If
+                        End If
+                    Case &H18        'Pending Event Time command received
+                        ReceivedText(dispString, "Pending Event Time command received. Time = " & ByteToDurationStr(receiveBuffer(5)))
+                        SendToLog(dispString, "Pending Event Time command received. Time = " & ByteToDurationStr(receiveBuffer(5)))
+                        tbPendEventTime.Text = ByteToDurationStr(receiveBuffer(5))
+                        SendLinkAck()
+                        If forceNak = True Then
+                            Reset_state()
+                        Else
+                            PauseMS(tARValBox.Value)      'Wait before sending response
                             xmitBuffer(0) = 8
                             xmitBuffer(1) = 1
                             xmitBuffer(2) = 0
                             xmitBuffer(3) = 2
+                            xmitBuffer(4) = 3
+                            xmitBuffer(5) = &H18
                             pendingAck = 0  'Set the pendingAck to nothing
                             pendingLinkAck = True  'Set the pendingLinkAck to true
-                            If cbAppNakMsg.Checked = True Then
-                                xmitBuffer(4) = 4       'Send a Nak instead
-                                xmitBuffer(5) = nudAppNakRtn.Value
-                                SendComData(xmitBuffer, 6, "Sent Application Nak", pendingLinkAck)
-                            Else
-                                xmitBuffer(4) = 3
-                                xmitBuffer(5) = &H17
-                                SendComData(xmitBuffer, 6, "Sent Application Ack of command type: 0x17", pendingLinkAck)
-                            End If
-                            If overRideSet = True Then sendOverridePend = True
-                            If cbResponseSim.Checked = True Then
-                                preShedOpState = OpStateBox.SelectedIndex 'Remembers old opstate
-                                'Set new state
-                                Select Case realSGDLoadUpResponse.SelectedIndex
-                                    Case 0
-                                        'Set to manual so do nothing
-                                    Case 1
-                                        'Not supported, send application level Nak
-                                        sendMsgNotSupportedNak()
-                                    Case 2
-                                        OpStateBox.SelectedIndex = 1
-                                    Case 3
-                                        OpStateBox.SelectedIndex = 0
-                                    Case 4
-                                        OpStateBox.SelectedIndex = 5
-                                End Select
-                                'If a timer is supported, set timer to countdown
-                                If internalClockSupportedcb.Checked = True And receiveBuffer(5) <> 0 And receiveBuffer(5) <> &HFF Then
-                                    shedEventTime = (receiveBuffer(5) * receiveBuffer(5)) * 2
-                                    shedEventTimer.Enabled = True
-                                End If
-                            End If
+                            SendComData(xmitBuffer, 6, "Sent Application Ack of command type: 0x18", pendingLinkAck)
                         End If
+                    Case &H19        'Pending Event Type command received
+                        ReceivedText(dispString, "Pending Event Type command received. Opcode2 = " & receiveBuffer(5))
+                        SendToLog(dispString, "Pending Event Type command received. Opcode2 = " & receiveBuffer(5))
+                        If receiveBuffer(5) = 1 Then
+                            tbPendEventType.Text = "Shed"
+                        ElseIf receiveBuffer(5) = 2 Then
+                            tbPendEventType.Text = "End Shed/Run Normal"
+                        ElseIf receiveBuffer(5) = &HA Then
+                            tbPendEventType.Text = "Critical Peak"
+                        ElseIf receiveBuffer(5) = &HB Then
+                            tbPendEventType.Text = "Grid Emergency"
+                        ElseIf receiveBuffer(5) = &H17 Then
+                            tbPendEventType.Text = "Load Up"
+                        End If
+                        SendLinkAck()
+                        If forceNak = True Then
+                            Reset_state()
+                        Else
+                            PauseMS(tARValBox.Value)      'Wait before sending response
+                            xmitBuffer(0) = 8
+                            xmitBuffer(1) = 1
+                            xmitBuffer(2) = 0
+                            xmitBuffer(3) = 2
+                            xmitBuffer(4) = 3
+                            xmitBuffer(5) = &H19
+                            pendingAck = 0  'Set the pendingAck to nothing
+                            pendingLinkAck = True  'Set the pendingLinkAck to true
+                            SendComData(xmitBuffer, 6, "Sent Application Ack of command type: 0x19", pendingLinkAck)
+                        End If
+                    Case &H1A        'Reboot command received
+                        ReceivedText(dispString, "Reboot command received. Opcode2 = " & receiveBuffer(5))
+                        SendToLog(dispString, "Reboot command received. Opcode2 = " & receiveBuffer(5))
+                        receiveIndex = 0
+                        SendLinkAck()
+                        If forceNak = True Then
+                            Reset_state()
+                        Else
+                            SendAppAck(&H1A, "Sent Application Ack of command type: 0x1A")
+                        End If
+
                     Case Else
                         ReceivedText(dispString, "Invalid Opcode Received: " & receiveBuffer(4))
-                        sendToLog(dispString, "Invalid Opcode Received: " & receiveBuffer(4))
-                        sendLinkNak(7)
+                        SendToLog(dispString, "Invalid Opcode Received: " & receiveBuffer(4))
+                        SendLinkNak(7)
                 End Select
             End If
         End If
@@ -5137,7 +6005,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub processGridGuidance(ByVal i As Byte, ByVal verbose As Byte, ByVal dispString As String)
+    Private Sub ProcessGridGuidance(ByVal i As Byte, ByVal verbose As Byte, ByVal dispString As String)
 
         If i = 0 Then           'Bad time to use energy
             If verbose = 1 Then ReceivedText(dispString, "Received Grid Guidance: Bad Time to Use Energy")
@@ -5147,7 +6015,7 @@ Public Class FrmMain
                 If realSGDBadTimeResponse.SelectedIndex = 0 Then        'Manual
                     If verbose = 1 Then ReceivedText("", "Grid Guidance 'Bad' recieved, but no change was made to Opstate")
                 ElseIf realSGDBadTimeResponse.SelectedIndex = 1 Then    'Not Supported, send linknak
-                    sendLinkNak(&H6)
+                    SendLinkNak(&H6)
                 ElseIf realSGDBadTimeResponse.SelectedIndex = 2 Then    'Running Curtailed Grid/ Running normal (override set)
                     If chkCustOverride.Checked = True Then
                         OpStateBox.SelectedIndex = 1
@@ -5184,7 +6052,7 @@ Public Class FrmMain
                 If realSGDGoodTimeResponse.SelectedIndex = 0 Then        'Manual
                     If verbose = 1 Then ReceivedText("", "Grid Guidance 'Good' recieved, but no change was made to Opstate")
                 ElseIf realSGDGoodTimeResponse.SelectedIndex = 1 Then    'Not Supported, send linknak
-                    sendLinkNak(&H6)
+                    SendLinkNak(&H6)
                 ElseIf realSGDGoodTimeResponse.SelectedIndex = 2 Then    'Running normal
                     OpStateBox.SelectedIndex = 1
                 ElseIf realSGDGoodTimeResponse.SelectedIndex = 3 Then    'Idle Normal
@@ -5200,7 +6068,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub btnSetUTC_Click(sender As Object, e As EventArgs) Handles btnSetUTC.Click
+    Private Sub BtnSetUTC_Click(sender As Object, e As EventArgs) Handles btnSetUTC.Click
         Dim xmitBuffer(14) As Byte
         Dim uTime As Integer
 
@@ -5230,9 +6098,8 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub btnStartCycling_Click(sender As Object, e As EventArgs) Handles btnStartCycling.Click
-        Dim xmitBuffer(22) As Byte
-        Dim tmparr(4) As Byte
+    Private Sub BtnStartCycling_Click(sender As Object, e As EventArgs) Handles btnStartCycling.Click
+        Dim xmitBuffer(36) As Byte
         Dim uTime As Integer
         Dim msgSize As Integer
         Dim startDate As New DateTime(1970, 1, 1, 0, 0, 0)
@@ -5269,30 +6136,33 @@ Public Class FrmMain
 
         'Duty Cycle
         xmitBuffer(16) = nudDutyCycle.Value
-
+        msgSize = 17
         'Start Randomization in mins - Optional. do not send if 0
-        xmitBuffer(17) = nudStartRandomization.Value
+        If nudStartRandomization.Value <> 0 Or nudEndRandomization.Value <> 0 Or nudCriticality.Value <> 0 Or nudDutyCyclePeriod.Value <> 0 Then
+            xmitBuffer(17) = nudStartRandomization.Value
+            msgSize = 18
+        End If
 
         'End Randomization in mins - Optional. do not send if 0
-        xmitBuffer(18) = nudEndRandomization.Value
+        If nudEndRandomization.Value <> 0 Or nudCriticality.Value <> 0 Or nudDutyCyclePeriod.Value <> 0 Then
+            xmitBuffer(18) = nudEndRandomization.Value
+            msgSize = 19
+        End If
 
         'Criticality - Optional. do not send if 0
-        xmitBuffer(19) = 0
+        If nudCriticality.Value <> 0 Or nudDutyCyclePeriod.Value <> 0 Then
+            xmitBuffer(19) = nudCriticality.Value
+            msgSize = 20
+        End If
+
+        'Duty cycle period in minutes - Optional. do not send if 0
+        If nudCriticality.Value <> 0 Or nudDutyCyclePeriod.Value <> 0 Then
+            xmitBuffer(20) = nudDutyCyclePeriod.Value
+            msgSize = 21
+        End If
+        xmitBuffer(3) = msgSize - 4
 
         'Send Message
-        msgSize = 20
-        If xmitBuffer(19) = 0 Then
-            msgSize -= 1
-            xmitBuffer(3) -= 1
-            If xmitBuffer(18) = 0 Then
-                msgSize -= 1
-                xmitBuffer(3) -= 1
-                If xmitBuffer(17) = 0 Then
-                    msgSize -= 1
-                    xmitBuffer(3) -= 1
-                End If
-            End If
-        End If
         pendingLinkAck = True
         SendComData(xmitBuffer, msgSize, "Sent Start Autonomous Cycling Command", pendingLinkAck)
         expectingResponse = True
@@ -5300,7 +6170,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub btnStopCycling_Click(sender As Object, e As EventArgs) Handles btnStopCycling.Click
+    Private Sub BtnStopCycling_Click(sender As Object, e As EventArgs) Handles btnStopCycling.Click
         Dim xmitBuffer(13) As Byte
         Dim tmparr(4) As Byte
 
@@ -5308,7 +6178,7 @@ Public Class FrmMain
         xmitBuffer(0) = 8
         xmitBuffer(1) = 2
         xmitBuffer(2) = 0
-        xmitBuffer(3) = 7
+        xmitBuffer(3) = 6
         xmitBuffer(4) = 4
         xmitBuffer(5) = 1
 
@@ -5318,14 +6188,12 @@ Public Class FrmMain
         xmitBuffer(8) = (nudStopEventID.Value >> 8) And &HFF
         xmitBuffer(7) = (nudStopEventID.Value >> 16) And &HFF
         xmitBuffer(6) = (nudStopEventID.Value >> 24) And &HFF
-
-        'End Randomization in mins - Optional. do not send if 0
-        xmitBuffer(10) = nudStopEndRand.Value
-
-        'Send Msg
-        If xmitBuffer(10) = 0 Then
-            xmitBuffer(3) -= 1
+        If nudStopEventID.Value <> 0 Then
+            'End Randomization in mins - Optional. do not send if 0
+            xmitBuffer(10) = nudStopEndRand.Value
+            xmitBuffer(3) = 7
         End If
+
         pendingLinkAck = True
         SendComData(xmitBuffer, xmitBuffer(3) + 4, "Sent Stop Autonomous Cycling Command", pendingLinkAck)
         expectingResponse = True
@@ -5333,7 +6201,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub pbCommoditySave_Click(sender As Object, e As EventArgs) Handles pbCommoditySave.Click
+    Private Sub PbCommoditySave_Click(sender As Object, e As EventArgs) Handles pbCommoditySave.Click
 
         commodityArray(lbCommodityCode.SelectedIndex).instRate = nudCommodityRate.Value
         commodityArray(lbCommodityCode.SelectedIndex).cumAmount = nudCommodityAmount.Value
@@ -5342,7 +6210,7 @@ Public Class FrmMain
         commodityArray(lbCommodityCode.SelectedIndex).updateFreq = nudCommodityFreq.Value
     End Sub
 
-    Private Sub lbCommodityCode_SelectedIndexChanged(sender As Object, e As EventArgs) Handles lbCommodityCode.SelectedIndexChanged
+    Private Sub LbCommodityCode_SelectedIndexChanged(sender As Object, e As EventArgs) Handles lbCommodityCode.SelectedIndexChanged
 
         nudCommodityRate.Value = commodityArray(lbCommodityCode.SelectedIndex).instRate
         nudCommodityAmount.Value = commodityArray(lbCommodityCode.SelectedIndex).cumAmount
@@ -5357,7 +6225,7 @@ Public Class FrmMain
         End If
     End Sub
 
-    Private Sub pbGetCommodity_Click(sender As Object, e As EventArgs) Handles pbGetCommodity.Click
+    Private Sub PbGetCommodity_Click(sender As Object, e As EventArgs) Handles pbGetCommodity.Click
         Dim xmitBuffer(8) As Byte
         'Get Commodity Read Request
         Try
@@ -5370,7 +6238,13 @@ Public Class FrmMain
             xmitBuffer(5) = 0
             pendingLinkAck = True
             pendingAck = 0
-            SendComData(xmitBuffer, 6, "Sent Get Commodity Read Request", pendingLinkAck)
+            If nudCommodityNum.Value = 10 Then
+                SendComData(xmitBuffer, 6, "Sent Get Commodity Read Request", pendingLinkAck)
+            Else
+                xmitBuffer(3) = 3
+                xmitBuffer(6) = nudCommodityNum.Value
+                SendComData(xmitBuffer, 7, "Sent Get Commodity Read Request", pendingLinkAck)
+            End If
             expectingResponse = True
 
         Catch ex As Exception
@@ -5378,7 +6252,7 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Sub pbSetCommodity_Click(sender As Object, e As EventArgs) Handles pbSetCommodity.Click
+    Private Sub PbSetCommodity_Click(sender As Object, e As EventArgs) Handles pbSetCommodity.Click
         Dim xmitBuffer(256) As Byte
         Dim i, j As Integer
 
@@ -5388,7 +6262,7 @@ Public Class FrmMain
         xmitBuffer(4) = &H6
         xmitBuffer(5) = &H0
         j = 0
-        For i = 0 To 7
+        For i = 0 To 9
             If commodityArray(i).supported = True Then
                 If commodityArray(i).estimated = True Then
                     xmitBuffer(j * 13 + 6) = i
@@ -5423,7 +6297,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub pbGetCommodSub_Click(sender As Object, e As EventArgs) Handles pbGetCommodSub.Click
+    Private Sub PbGetCommodSub_Click(sender As Object, e As EventArgs) Handles pbGetCommodSub.Click
         Dim xmitBuffer(16) As Byte
 
         xmitBuffer(0) = 8
@@ -5438,7 +6312,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub pbSetCommodSub_Click(sender As Object, e As EventArgs) Handles pbSetCommodSub.Click
+    Private Sub PbSetCommodSub_Click(sender As Object, e As EventArgs) Handles pbSetCommodSub.Click
         Dim xmitBuffer(32) As Byte
         Dim i, j As Integer
 
@@ -5449,7 +6323,7 @@ Public Class FrmMain
         xmitBuffer(4) = 6
         xmitBuffer(5) = 1
         j = 0
-        For i = 0 To 7
+        For i = 0 To 9
             If commodityArray(i).supported = True Then
                 xmitBuffer(3) += 3
                 xmitBuffer((j * 3) + 6) = i
@@ -5464,7 +6338,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub pbSetTempOffset_Click(sender As Object, e As EventArgs) Handles pbSetTempOffset.Click
+    Private Sub PbSetTempOffset_Click(sender As Object, e As EventArgs) Handles pbSetTempOffset.Click
         Dim xmitBuffer(10) As Byte
         Dim tmparr(4) As Byte
         Dim problem As Boolean = False
@@ -5499,7 +6373,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub pbRequestTempOffset_Click(sender As Object, e As EventArgs) Handles pbRequestTempOffset.Click
+    Private Sub PbRequestTempOffset_Click(sender As Object, e As EventArgs) Handles pbRequestTempOffset.Click
         Dim xmitBuffer(8) As Byte
 
         'Clear response boxes
@@ -5521,7 +6395,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub btnMaxPayload_Click(sender As Object, e As EventArgs) Handles btnMaxPayload.Click
+    Private Sub BtnMaxPayload_Click(sender As Object, e As EventArgs) Handles btnMaxPayload.Click
         Dim xmitBuffer(8) As Byte
 
         Try
@@ -5541,7 +6415,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub pbCommRefresh_Click(sender As Object, e As EventArgs) Handles pbCommRefresh.Click
+    Private Sub PbCommRefresh_Click(sender As Object, e As EventArgs) Handles pbCommRefresh.Click
         Dim i As Integer
 
         Try
@@ -5561,7 +6435,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub pbOpenScript_Click(sender As Object, e As EventArgs) Handles pbOpenScript.Click
+    Private Sub PbOpenScript_Click(sender As Object, e As EventArgs) Handles pbOpenScript.Click
         Try
             If fbdScriptFileSelect.ShowDialog() = DialogResult.OK Then
                 tbScriptFile.Text = fbdScriptFileSelect.FileName
@@ -5602,6 +6476,9 @@ Public Class FrmMain
                     testScriptLine += 1
                 Loop
 
+                '*******************************************
+                'Script Control messages
+                '*******************************************
                 'The next script command is located
                 If (Mid(stringReader, 1, 9) = "EndScript") Then
                     scriptFileReader.Close()
@@ -5611,38 +6488,34 @@ Public Class FrmMain
                     pbOpenScript.Enabled = True
                     pbKillScript.Enabled = False
                     If scriptPassed = 0 Then
-                        sendToLog("", "Test Script Execution Completed: All Tests Successful")
-                        addToScriptFeed("Test Script Execution Completed: All Tests Successful")
+                        SendToLog("", "Test Script Execution Completed: All Tests Successful")
+                        AddToScriptFeed("Test Script Execution Completed: All Tests Successful")
                     ElseIf scriptPassed = 1 Then
-                        sendToLog("", "Test Script Execution Completed: 1 Test Failed")
-                        addToScriptFeed("Test Script Execution Completed: 1 Test Failed")
+                        SendToLog("", "Test Script Execution Completed: 1 Test Failed")
+                        AddToScriptFeed("Test Script Execution Completed: 1 Test Failed")
                     Else
-                        sendToLog("", "Test Script Execution Completed: " & scriptPassed & " Tests Failed")
-                        addToScriptFeed("Test Script Execution Completed: " & scriptPassed & " Tests Failed")
+                        SendToLog("", "Test Script Execution Completed: " & scriptPassed & " Tests Failed")
+                        AddToScriptFeed("Test Script Execution Completed: " & scriptPassed & " Tests Failed")
                     End If
                     scriptPassed = 0
                     Return -1
 
-                ElseIf (Mid(stringReader, 1, 16) = "AutoCyclingStart") Then
-                    btnStartCycling_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Autonomous Cycling Started")
+                ElseIf (Mid(stringReader, 1, 10) = "LogComment") Then
+                    SendToLog("", "Script Comment: " & Mid(stringReader, 12, stringReader.Length - 11))
+                    AddToScriptFeed(Mid(stringReader, 12, stringReader.Length - 11))
 
-                ElseIf (Mid(stringReader, 1, 15) = "AutoCyclingStop") Then
-                    btnStopCycling_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Autonomous Cycling Stopped")
-
-                ElseIf (Mid(stringReader, 1, 12) = "CriticalPeak") Then
-                    trkShedDur.Value = getParam1int(14, stringReader)
-                    criticalPeakButton_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Critical Peak Pricing Event")
+                ElseIf (Mid(stringReader, 1, 14) = "ManualValidate") Then
+                    pbManCont.Enabled = True        ' Set to true to halt script
+                    pbManCont.Visible = False       ' but make invisible
+                    pbManualPass.Enabled = True     ' Make pass button visible and functional
+                    pbManualPass.Visible = True
+                    pbManualFail.Enabled = True     ' Make pass button visible and functional
+                    pbManualFail.Visible = True
+                    AddToScriptFeed("Click Pass of Fail buttton to continue")
 
                 ElseIf (Mid(stringReader, 1, 5) = "Delay") Then
-                    nextScriptTime = DateTime.Now.AddMilliseconds(getParam1int(7, stringReader))     'Wait for specified number of ms before processing next command
-                    addToScriptFeed("Delay")
-
-                ElseIf (Mid(stringReader, 1, 13) = "DeviceInfo") Then
-                    queryDeviceInfoButton_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Query Device Information")
+                    nextScriptTime = DateTime.Now.AddMilliseconds(GetParam1int(7, stringReader))     'Wait for specified number of ms before processing next command
+                    AddToScriptFeed("Delay")
 
                 ElseIf (Mid(stringReader, 1, 6) = "Device") Then
                     If (Mid(stringReader, 8, 3) = "UCM") Then
@@ -5663,116 +6536,32 @@ Public Class FrmMain
                         End If
                     End If
 
-                ElseIf (Mid(stringReader, 1, 13) = "GridEmergency") Then
-                    trkShedDur.Value = getParam1int(15, stringReader)
-                    gridEmergencyButton_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Grid Emergency Event")
-
-                ElseIf (Mid(stringReader, 1, 12) = "GridGuidence") Then
-                    cmbGridGuide.SelectedIndex = getParam1int(14, stringReader)
-                    sendGuidenceButton_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Grid Guidance Event")
-
                 ElseIf (Mid(stringReader, 1, 10) = "HaltOnFail") Then
                     haltOnFail = True
 
-                ElseIf (Mid(stringReader, 1, 9) = "LoadUpEnd") Then
-                    btnEndShed_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Load Up Event Terminate")
-
-                ElseIf (Mid(stringReader, 1, 6) = "LoadUp") Then
-                    trkShedDur.Value = getParam1int(8, stringReader)
-                    pbLoadUp_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Load Up Event")
-
-                ElseIf (Mid(stringReader, 1, 10) = "LogComment") Then
-                    sendToLog("", "Script Comment: " & Mid(stringReader, 12, stringReader.Length - 11))
-                    addToScriptFeed(Mid(stringReader, 12, stringReader.Length - 11))
-
-                ElseIf (Mid(stringReader, 1, 14) = "ManualValidate") Then
-                    pbManCont.Enabled = True        ' Set to true to halt script
-                    pbManCont.Visible = False       ' but make invisible
-                    pbManualPass.Enabled = True     ' Make pass button visible and functional
-                    pbManualPass.Visible = True
-                    pbManualFail.Enabled = True     ' Make pass button visible and functional
-                    pbManualFail.Visible = True
-                    addToScriptFeed("Click Pass of Fail buttton to continue")
-
-                ElseIf (Mid(stringReader, 1, 14) = "MsgTypeSupport") Then
-                    scriptIndex = 16
-                    nudSupMsgQueryMSB.Value = getParam1int(scriptIndex, stringReader)
-                    nudSupMsgQueryLSB.Value = getParam1int(scriptIndex, stringReader)
-                    msgTypeQuery_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Message Type Support query")
-
-                ElseIf (Mid(stringReader, 1, 12) = "NextRelPrice") Then
-                    nextPeriodTrackBar.Value = getParam1int(14, stringReader)
-                    nextPeriodPriceButton_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Next Relative Price")
-
                 ElseIf (Mid(stringReader, 1, 5) = "Pause") Then
-                    addToScriptFeed(Mid(stringReader, 7, stringReader.Length - 6))
+                    AddToScriptFeed(Mid(stringReader, 7, stringReader.Length - 6))
                     pbManCont.Enabled = True
                     pbManCont.Visible = True
-
-                ElseIf (Mid(stringReader, 1, 12) = "PresRelPrice") Then
-                    presentPriceTrackBar.Value = getParam1int(14, stringReader)
-                    presentPriceButton_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Present Relative Price")
-
-                ElseIf (Mid(stringReader, 1, 12) = "QueryOpState") Then
-                    pbOpState_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Query Operating State")
-                ElseIf (Mid(stringReader, 1, 13) = "ReqPowerLevel") Then
-                    tbarPower.Value = getParam1int(15, stringReader)
-                    btnRPLAccept_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Request Power Level")
-
-                ElseIf (Mid(stringReader, 1, 9) = "RunNormal") Then
-                    btnEndShed_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("End Shed/Run Normal")
-
-                ElseIf (Mid(stringReader, 1, 10) = "SetUTCTime") Then
-                    scriptIndex = 12
-                    nudUTCOffset.Value = getParam1int(scriptIndex, stringReader)
-                    nudDSTOffset.Value = getParam1int(scriptIndex, stringReader)
-                    btnSetUTC_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Set UTC Time")
-
-                ElseIf (Mid(stringReader, 1, 4) = "Shed") Then
-                    trkShedDur.Value = getParam1int(6, stringReader)
-                    btnShedSend_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Shed Event")
-
-                ElseIf (Mid(stringReader, 1, 10) = "TimeRemain") Then
-                    timeRemainingTrackBar.Value = getParam1int(12, stringReader)
-                    timeRemainingButton_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Time Remaining")
-
-                ElseIf (Mid(stringReader, 1, 10) = "SetUTCTime") Then
-                    scriptIndex = 12
-                    nudUTCOffset.Value = getParam1int(scriptIndex, stringReader)
-                    nudDSTOffset.Value = getParam1int(scriptIndex, stringReader)
-                    btnSetUTC_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Set UTC Time")
-
-                ElseIf (Mid(stringReader, 1, 12) = "CommodityGet") Then
-                    pbGetCommodity_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Get Commodity")
 
                 ElseIf (Mid(stringReader, 1, 9) = "BadOpCode") Then
                     scriptIndex = 11
                     badOpcode1cb.Checked = True
                     badOpcode2cb.Checked = True
-                    badOpcode1valbox.Value = getParam1int(scriptIndex, stringReader)
-                    badOpcode2valbox.Value = getParam1int(scriptIndex, stringReader)
+                    badOpcode1valbox.Value = GetParam1int(scriptIndex, stringReader)
+                    badOpcode2valbox.Value = GetParam1int(scriptIndex, stringReader)
+
+                ElseIf (Mid(stringReader, 1, 14) = "ResetBadOpCode") Then
+                    badOpcode1cb.Checked = False
+                    badOpcode2cb.Checked = False
+                    AddToScriptFeed("Bad OpCodes Reset")
 
                 ElseIf (Mid(stringReader, 1, 13) = "CustomCommand") Then
                     scriptIndex = 15
                     Try
                         Do While scriptIndex <= stringReader.Length
-                            i = getParam1int(scriptIndex, stringReader)
-                            j = getParam1int(scriptIndex, stringReader)
+                            i = GetParam1int(scriptIndex, stringReader)
+                            j = GetParam1int(scriptIndex, stringReader)
                             Select Case i
                                 Case 0
                                     customMsgType1cb.Checked = True
@@ -5795,8 +6584,8 @@ Public Class FrmMain
                             End Select
                         Loop
                     Catch e As Exception
-                        addToScriptFeed("Custom Command on line " + Convert.ToString(testScriptLine) + " has a problem!")
-                        pbKillScript_Click(Ex_sender, Ex_e)
+                        AddToScriptFeed("Custom Command on line " + Convert.ToString(testScriptLine) + " has a problem!")
+                        PbKillScript_Click(Ex_sender, Ex_e)
                     End Try
 
                 ElseIf (Mid(stringReader, 1, 18) = "ResetCustomCommand") Then
@@ -5806,20 +6595,15 @@ Public Class FrmMain
                     customLength2cb.Checked = False
                     customMsgType1cb.Checked = False
                     customMsgType2cb.Checked = False
-                    addToScriptFeed("Custom bytes reset")
-
-                ElseIf (Mid(stringReader, 1, 14) = "ResetBadOpCode") Then
-                    badOpcode1cb.Checked = False
-                    badOpcode2cb.Checked = False
-                    addToScriptFeed("Bad OpCodes Reset")
+                    AddToScriptFeed("Custom bytes reset")
 
                 ElseIf (Mid(stringReader, 1, 14) = "ValidateResult") Then
                     scriptIndex = 16
                     paramCount = 0
                     'Loop through arguments and add them to arrays for processing
                     Do While scriptIndex < stringReader.Length
-                        byteOffset(paramCount) = getParam1int(scriptIndex, stringReader)
-                        byteValue(paramCount) = getParam1int(scriptIndex, stringReader)
+                        byteOffset(paramCount) = GetParam1int(scriptIndex, stringReader)
+                        byteValue(paramCount) = GetParam1int(scriptIndex, stringReader)
                         paramCount += 1
                     Loop
                     i = 0
@@ -5852,22 +6636,89 @@ Public Class FrmMain
                     Loop
 
                     If verifyPass = True Then
-                        addToScriptFeed("Pass")
-                        sendToLog("", "Script: Pass")
+                        AddToScriptFeed("Pass")
+                        SendToLog("", "Script: Pass")
                     Else
                         scriptPassed += 1
-                        addToScriptFeed("Fail")
-                        sendToLog("", "Script: Fail")
+                        AddToScriptFeed("Fail")
+                        SendToLog("", "Script: Fail")
                         If haltOnFail = True Then
                             scriptFileReader.Close()
                             nextScriptTime = New DateTime(1970, 1, 1)
                             pbExecuteScript.Enabled = True
                             testScriptbtn.Enabled = True
                             pbKillScript.Enabled = False
-                            addToScriptFeed("Test script execution aborted on failure")
+                            AddToScriptFeed("Test script execution aborted on failure")
                         End If
                     End If
                     lastReceivedMsgSize = 0
+
+                    '*******************************************
+                    'Link Layer messages
+                    '*******************************************
+                ElseIf (Mid(stringReader, 1, 14) = "MsgTypeSupport") Then
+                    scriptIndex = 16
+                    nudSupMsgQueryMSB.Value = GetParam1int(scriptIndex, stringReader)
+                    nudSupMsgQueryLSB.Value = GetParam1int(scriptIndex, stringReader)
+                    MsgTypeQuery_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Message Type Support query")
+
+                ElseIf (Mid(stringReader, 1, 15) = "QueryMaxPayload") Then  'Send a Max Payload Query
+                    BtnMaxPayload_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Max Payload query")
+
+                ElseIf (Mid(stringReader, 1, 13) = "ReqPowerLimit") Then  'Send a Power Limit Request
+                    scriptIndex = 15
+                    nudPowerLimit.Value = GetParam1int(scriptIndex, stringReader)
+                    PbPowerLimit_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Request Power Limit")
+
+                    '*******************************************
+                    'Basic messages
+                    '*******************************************
+                ElseIf (Mid(stringReader, 1, 4) = "Shed") Then
+                    trkShedDur.Value = GetParam1int(6, stringReader)
+                    BtnShedSend_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Shed Event")
+
+                ElseIf (Mid(stringReader, 1, 9) = "RunNormal") Then
+                    BtnEndShed_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("End Shed/Run Normal")
+
+                ElseIf (Mid(stringReader, 1, 13) = "ReqPowerLevel") Then
+                    tbarPower.Value = GetParam1int(15, stringReader)
+                    BtnRPLAccept_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Request Power Level")
+
+                ElseIf (Mid(stringReader, 1, 12) = "PresRelPrice") Then
+                    presentPriceTrackBar.Value = GetParam1int(14, stringReader)
+                    PresentPriceButton_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Present Relative Price")
+
+                ElseIf (Mid(stringReader, 1, 12) = "NextRelPrice") Then
+                    nextPeriodTrackBar.Value = GetParam1int(14, stringReader)
+                    NextPeriodPriceButton_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Next Relative Price")
+
+                ElseIf (Mid(stringReader, 1, 10) = "TimeRemain") Then
+                    timeRemainingTrackBar.Value = GetParam1int(12, stringReader)
+                    TimeRemainingButton_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Time Remaining")
+
+                ElseIf (Mid(stringReader, 1, 12) = "CriticalPeak") Then
+                    trkShedDur.Value = GetParam1int(14, stringReader)
+                    CriticalPeakButton_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Critical Peak Pricing Event")
+
+                ElseIf (Mid(stringReader, 1, 13) = "GridEmergency") Then
+                    trkShedDur.Value = GetParam1int(15, stringReader)
+                    GridEmergencyButton_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Grid Emergency Event")
+
+                ElseIf (Mid(stringReader, 1, 12) = "GridGuidence") Then
+                    cmbGridGuide.SelectedIndex = GetParam1int(14, stringReader)
+                    SendGuidenceButton_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Grid Guidance Event")
 
                 ElseIf (Mid(stringReader, 1, 10) = "CommStatus") Then       'Send out a comm status message
                     'Set the status type
@@ -5881,15 +6732,140 @@ Public Class FrmMain
                     scriptIndex = 17
 
                     'Set the auto update time
-                    autoCommStatusTimer.Interval = getParam1int(scriptIndex, stringReader)
+                    autoCommStatusTimer.Interval = GetParam1int(scriptIndex, stringReader)
 
                     'Send message
-                    addToScriptFeed("Sending Comm Status")
-                    sendCommStatus(realUCMCommStatusBox.SelectedIndex - 1)
+                    AddToScriptFeed("Sending Comm Status")
+                    SendCommStatus(realUCMCommStatusBox.SelectedIndex - 1)
 
-                ElseIf (Mid(stringReader, 1, 15) = "QueryMaxPayload") Then  'Send a Max Payload Query
-                    btnMaxPayload_Click(Ex_sender, Ex_e)
-                    addToScriptFeed("Max Payload query")
+                ElseIf (Mid(stringReader, 1, 12) = "QueryOpState") Then
+                    PbOpState_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Query Operating State")
+
+                ElseIf (Mid(stringReader, 1, 12) = "QueryOpStateResp") Then
+                    SendOpStateBtn_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Sent Query Operating State response")
+
+                ElseIf (Mid(stringReader, 1, 6) = "LoadUp") Then
+                    trkShedDur.Value = GetParam1int(8, stringReader)
+                    PbLoadUp_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Load Up Event")
+
+                ElseIf (Mid(stringReader, 1, 17) = "SendPendEventTime") Then
+                    trkPendEventDuration.Value = GetParam1int(19, stringReader)
+                    SendPendEventTimePb_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Sent Pending Event Time")
+
+                ElseIf (Mid(stringReader, 1, 17) = "SendPendEventType") Then
+                    pendEventTypeCb.SelectedIndex = GetParam1int(19, stringReader)
+                    SendPendEventTypePb_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Sent Pending Event Type")
+
+                ElseIf (Mid(stringReader, 1, 6) = "Reboot") Then
+                    cbRebootType.SelectedIndex = GetParam1int(8, stringReader)
+                    BReboot_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Reboot Request")
+
+                    '*******************************************
+                    'Intermediate messages
+                    '*******************************************
+                ElseIf (Mid(stringReader, 1, 13) = "DeviceInfo") Then
+                    QueryDeviceInfoButton_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Query Device Information")
+
+                ElseIf (Mid(stringReader, 1, 10) = "SetUTCTime") Then
+                    scriptIndex = 12
+                    nudUTCOffset.Value = GetParam1int(scriptIndex, stringReader)
+                    nudDSTOffset.Value = GetParam1int(scriptIndex, stringReader)
+                    BtnSetUTC_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Set UTC Time")
+
+                ElseIf (Mid(stringReader, 1, 14) = "GetEnergyPrice") Then
+                    PbGetEnergyPrice_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Sent Get Energy Price Request")
+
+                ElseIf (Mid(stringReader, 1, 14) = "SetEnergyPrice") Then
+                    PbSetEnergyPrice_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Sent Set Energy Price Request")
+
+                ElseIf (Mid(stringReader, 1, 13) = "SetTempOffset") Then
+                    nudTempOffset.Value = GetParam1int(15, stringReader)
+                    PbSetTempOffset_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Sent Set Temperature Offset Request")
+
+                ElseIf (Mid(stringReader, 1, 13) = "GetTempOffset") Then
+                    PbRequestTempOffset_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Sent Get Temperature Offset Request")
+
+                ElseIf (Mid(stringReader, 1, 15) = "SetTempSetpoint") Then
+                    nudSetPoint1.Value = GetParam1int(17, stringReader)
+                    nudSetPoint2.Value = GetParam1int(23, stringReader)
+                    i = GetParam1int(29, stringReader)
+                    If (i = 0) Then
+                        cbSetpoint2Support.Checked = True
+                    Else
+                        cbSetpoint2Support.Checked = False
+                    End If
+                    PbSetSetPoint_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Sent Set Temperature Setpoint Request")
+
+                ElseIf (Mid(stringReader, 1, 15) = "GetTempSetpoint") Then
+                    PbRequestSetpoint_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Sent Get Temperature Setpoint Request")
+
+                ElseIf (Mid(stringReader, 1, 11) = "GetPresTemp") Then
+                    PbGetPresentTemp_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Get Present Temperature Request")
+
+                ElseIf (Mid(stringReader, 1, 16) = "AutoCyclingStart") Then
+                    BtnStartCycling_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Autonomous Cycling Started")
+
+                ElseIf (Mid(stringReader, 1, 15) = "AutoCyclingStop") Then
+                    BtnStopCycling_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Autonomous Cycling Stopped")
+
+                ElseIf (Mid(stringReader, 1, 12) = "CommodityGet") Then
+                    nudCommodityNum.Value = GetParam1int(14, stringReader)
+                    PbGetCommodity_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Get Commodity")
+
+                ElseIf (Mid(stringReader, 1, 13) = "ActivationGet") Then
+                    PbGetActStatus_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Sent Get Activation command")
+
+                ElseIf (Mid(stringReader, 1, 13) = "ActivationSet") Then
+                    PbSetActStatus_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Sent Set Activation command")
+
+                ElseIf (Mid(stringReader, 1, 16) = "UserPrefLevelGet") Then
+                    PbGetPrefLevel_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Sent Get User Preference Level command")
+
+                ElseIf (Mid(stringReader, 1, 16) = "UserPrefLevelSet") Then
+                    PbSetPrefLevel_Click(Ex_sender, Ex_e)
+                    AddToScriptFeed("Sent Set User Preference Level command")
+
+                ElseIf (Mid(stringReader, 1, 20) = "SetInterResponseCode") Then
+                    cbInterRespCode.SelectedIndex = GetParam1int(22, stringReader)
+                    AddToScriptFeed("Set default intermediate command response code")
+
+                ElseIf (Mid(stringReader, 1, 9) = "RawPacket") Then  'Send a Raw Packet to other device
+                    Dim dataString As String()
+                    Dim xmitBuffer() As Byte
+                    Try
+                        dataString = Mid(stringReader, 11).Split()
+                        ReDim xmitBuffer(dataString.Count + 1)
+                        For index As Integer = 0 To dataString.Count - 1
+                            xmitBuffer(index) = CInt("&H" & dataString(index))
+                        Next
+
+                        SendComData(xmitBuffer, dataString.Length, "Sending Raw DR Packets", pendingLinkAck)
+
+                    Catch e As Exception
+                        addToScriptFeed("Custom Command on line " + Convert.ToString(testScriptLine) + " has a problem!")
+                        pbKillScript_Click(Ex_sender, Ex_e)
+                    End Try
 
                 Else
                     scriptFileReader.Close()
@@ -5897,7 +6873,7 @@ Public Class FrmMain
                     pbExecuteScript.Enabled = True
                     testScriptbtn.Enabled = True
                     pbKillScript.Enabled = False
-                    addToScriptFeed("Undefined command in test script line " + Convert.ToString(testScriptLine))
+                    AddToScriptFeed("Undefined command in test script line " + Convert.ToString(testScriptLine))
                     Return -1
                 End If
             End If
@@ -5910,7 +6886,7 @@ Public Class FrmMain
 
     End Function
 
-    Private Sub pbExecuteScript_Click(sender As Object, e As EventArgs) Handles pbExecuteScript.Click
+    Private Sub PbExecuteScript_Click(sender As Object, e As EventArgs) Handles pbExecuteScript.Click
 
         Ex_sender = sender
         Ex_e = e
@@ -5940,7 +6916,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub pbKillScript_Click(sender As Object, e As EventArgs) Handles pbKillScript.Click
+    Private Sub PbKillScript_Click(sender As Object, e As EventArgs) Handles pbKillScript.Click
         scriptFileReader.Close()
         nextScriptTime = New DateTime(1970, 1, 1)
         nextScriptTestTime = New DateTime(1970, 1, 1)
@@ -5952,12 +6928,12 @@ Public Class FrmMain
     End Sub
 
     'Add text to the feed box and continue to scroll to the bottom
-    Private Sub addToScriptFeed(ByRef text As String)
+    Private Sub AddToScriptFeed(ByRef text As String)
 
         Try
             'compares the ID of the creating Thread to the ID of the calling Thread
             If Me.rtbReceived.InvokeRequired Then
-                Dim x As New SetTextCallback3(AddressOf addToScriptFeed)
+                Dim x As New SetTextCallback3(AddressOf AddToScriptFeed)
                 Me.Invoke(x, New Object() {(text)})
             Else
                 If text <> "" Then
@@ -5971,51 +6947,57 @@ Public Class FrmMain
         End Try
     End Sub
 
-    Private Function getParam1int(ByRef scriptIndex As Integer, ByRef textString As String)
+    Private Function GetParam1int(ByRef scriptIndex As Integer, ByRef textString As String)
         Dim tempStr As String
-
+        ' TODO : Skip Extra Space between Commands or Parameters
+        'For index = scriptIndex To (textString.Length + 1)
+        '    If Mid(textString, scriptIndex, 1) <> " " Then
+        '        Exit For
+        '    End If
+        '    scriptIndex += 1
+        'Next
         tempStr = ""
         While Mid(textString, scriptIndex, 1) <> " " And scriptIndex < (textString.Length + 1)
             tempStr = tempStr + Mid(textString, scriptIndex, 1)
             scriptIndex = scriptIndex + 1
         End While
         scriptIndex = scriptIndex + 1
-        getParam1int = Convert.ToInt32(tempStr)
+        GetParam1int = Convert.ToInt32(tempStr)
     End Function
 
-    Private Sub pbManCont_Click(sender As Object, e As EventArgs) Handles pbManCont.Click
+    Private Sub PbManCont_Click(sender As Object, e As EventArgs) Handles pbManCont.Click
         pbManCont.Enabled = False
         pbManCont.Visible = False
         scriptFeedBox.Font = New Font(scriptFeedBox.Font.FontFamily, 10, FontStyle.Regular)
     End Sub
 
-    Private Sub pbManualPass_Click(sender As Object, e As EventArgs) Handles pbManualPass.Click
+    Private Sub PbManualPass_Click(sender As Object, e As EventArgs) Handles pbManualPass.Click
         pbManCont.Enabled = False        ' Set to true to halt script
         pbManualPass.Enabled = False
         pbManualPass.Visible = False
         pbManualFail.Enabled = False
         pbManualFail.Visible = False
         'logFileBuffer &= "Pass"
-        sendToLog("", "Script: Pass")
+        SendToLog("", "Script: Pass")
 
     End Sub
 
-    Private Sub pbManualFail_Click(sender As Object, e As EventArgs) Handles pbManualFail.Click
+    Private Sub PbManualFail_Click(sender As Object, e As EventArgs) Handles pbManualFail.Click
         pbManCont.Enabled = False        ' Set to true to halt script
         pbManualPass.Enabled = False
         pbManualPass.Visible = False
         pbManualFail.Enabled = False
         pbManualFail.Visible = False
         scriptPassed += 1
-        sendToLog("", "Script: Fail")
+        SendToLog("", "Script: Fail")
 
     End Sub
 
-    Private Sub tsmAbout_Click(sender As Object, e As EventArgs) Handles tsmAbout.Click
-        AboutForm.Show()
+    Private Sub TsmAbout_Click(sender As Object, e As EventArgs)
+        License.Show()
     End Sub
 
-    Private Sub nudSupMsgQueryMSB_ValueChanged(sender As Object, e As EventArgs)
+    Private Sub NudSupMsgQueryMSB_ValueChanged(sender As Object, e As EventArgs)
         'Valid messages currently only start with 8 or 9, other values cause bugs
         If nudSupMsgQueryMSB.Value > 9 Then
             nudSupMsgQueryMSB.Value = 9
@@ -6024,7 +7006,7 @@ Public Class FrmMain
         End If
     End Sub
 
-    Private Sub Button1_Click(sender As Object, e As EventArgs)
+    Private Sub SendCommStatusBtn_Click(sender As Object, e As EventArgs)
         MsgBox("5 Seconds = 5000ms" & Environment.NewLine &
                            "30 Seconds = 30000ms" & Environment.NewLine &
                            "1 Minute = 60000ms" & Environment.NewLine &
@@ -6034,13 +7016,13 @@ Public Class FrmMain
                            "1 Hour = 3600000ms")
     End Sub
 
-    Private Sub autoCommStatusTimer_Tick(sender As Object, e As EventArgs) Handles autoCommStatusTimer.Tick
+    Private Sub AutoCommStatusTimer_Tick(sender As Object, e As EventArgs) Handles autoCommStatusTimer.Tick
 
         Try
             'If enabled, send a comm status every tick
             If cbResponseSim.Checked = True Then
                 If realUCMCommStatusBox.SelectedIndex <> 0 Then
-                    sendCommStatus(realUCMCommStatusBox.SelectedIndex - 1)
+                    SendCommStatus(realUCMCommStatusBox.SelectedIndex - 1)
                 End If
             Else
                 autoCommStatusTimer.Enabled = False
@@ -6052,12 +7034,12 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub realUCMCommStatusBox_SelectedIndexChanged(sender As Object, e As EventArgs) Handles realUCMCommStatusBox.SelectedIndexChanged
+    Private Sub RealUCMCommStatusBox_SelectedIndexChanged(sender As Object, e As EventArgs) Handles realUCMCommStatusBox.SelectedIndexChanged
 
         'If manual mode is not selected and simulating a real device
         If cbResponseSim.Checked = True And realUCMCommStatusBox.SelectedIndex <> 0 Then
             'Send first message
-            sendCommStatus(realUCMCommStatusBox.SelectedIndex - 1)
+            SendCommStatus(realUCMCommStatusBox.SelectedIndex - 1)
             'Enable timer to start sending messages automatically
             autoCommStatusTimer.Enabled = True
         Else
@@ -6066,17 +7048,17 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub realUCMTrasmissionIntervalBox_ValueChanged(sender As Object, e As EventArgs) Handles realUCMTrasmissionIntervalBox.ValueChanged
+    Private Sub RealUCMTrasmissionIntervalBox_ValueChanged(sender As Object, e As EventArgs) Handles realUCMTrasmissionIntervalBox.ValueChanged
         autoCommStatusTimer.Interval = realUCMTrasmissionIntervalBox.Value * 1000
     End Sub
 
-    Private Sub shedEventTimer_Tick(sender As Object, e As EventArgs) Handles shedEventTimer.Tick
+    Private Sub ShedEventTimer_Tick(sender As Object, e As EventArgs) Handles shedEventTimer.Tick
         'Count down to the end of the event
         If shedEventTime > 0 Then
             shedEventTime = shedEventTime - 1
         Else
             If rbMode1.Checked = True Then      'This is a UCM
-                btnEndShed_Click(Ex_sender, Ex_e)
+                BtnEndShed_Click(Ex_sender, Ex_e)
             Else                                'This is an SGD
                 Select Case realSGDEndShedResponse.SelectedIndex
                     Case 0
@@ -6096,7 +7078,7 @@ Public Class FrmMain
         End If
     End Sub
 
-    Private Sub commStatusTimoutTmr_Tick(sender As Object, e As EventArgs) Handles commStatusTimoutTmr.Tick
+    Private Sub CommStatusTimoutTmr_Tick(sender As Object, e As EventArgs) Handles commStatusTimoutTmr.Tick
         'Checks that everything is still enabled
         If cbResponseSim.Checked = True And internalClockSupportedcb.Checked = True Then
             'Count down from last comm status received
@@ -6125,7 +7107,7 @@ Public Class FrmMain
                 'Reset Price
                 'As of writing this, nothing is done when pricing info is recieved, so there is nothing to reset
                 'Reset Grid Guidance
-                processGridGuidance(1, 0, "")
+                ProcessGridGuidance(1, 0, "")
                 'Reset timer
                 commStatusTimeoutTime = realSGDNoCommTimeoutValBox.Value
             End If
@@ -6136,7 +7118,7 @@ Public Class FrmMain
         End If
     End Sub
 
-    Private Sub realSGDNoCommTimeoutEnabledbtn_Click(sender As Object, e As EventArgs) Handles realSGDNoCommTimeoutEnabledbtn.Click
+    Private Sub RealSGDNoCommTimeoutEnabledbtn_Click(sender As Object, e As EventArgs) Handles realSGDNoCommTimeoutEnabledbtn.Click
         If (cbResponseSim.Checked = True And internalClockSupportedcb.Checked = True) Or realSGDNoCommTimeoutEnabledbtn.Text = "Disable" Then
             If realSGDNoCommTimeoutEnabledbtn.Text = "Enable" Then
                 commStatusTimeoutTime = realSGDNoCommTimeoutValBox.Value
@@ -6149,11 +7131,11 @@ Public Class FrmMain
         End If
     End Sub
 
-    Private Sub Button1_Click_1(sender As Object, e As EventArgs) Handles Button1.Click
-        sendCommStatus(cmbCommStatus.SelectedIndex)
+    Private Sub SendCommStatusBtn_Click_1(sender As Object, e As EventArgs) Handles SendCommStatusBtn.Click
+        SendCommStatus(cmbCommStatus.SelectedIndex)
     End Sub
 
-    Private Sub cbResponseSim_CheckedChanged(sender As Object, e As EventArgs) Handles cbResponseSim.CheckedChanged
+    Private Sub CbResponseSim_CheckedChanged(sender As Object, e As EventArgs) Handles cbResponseSim.CheckedChanged
 
         If cbResponseSim.Checked = True Then
             autoCommStatusTimer.Enabled = True
@@ -6162,7 +7144,7 @@ Public Class FrmMain
         End If
     End Sub
 
-    Private Sub badOpcode1cb_CheckedChanged(sender As Object, e As EventArgs) Handles badOpcode1cb.CheckedChanged
+    Private Sub BadOpcode1cb_CheckedChanged(sender As Object, e As EventArgs) Handles badOpcode1cb.CheckedChanged
         If badOpcode1cb.Checked = True Then
             badOpcode1valbox.Enabled = True
         Else
@@ -6171,7 +7153,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub badOpcode2cb_CheckedChanged(sender As Object, e As EventArgs) Handles badOpcode2cb.CheckedChanged
+    Private Sub BadOpcode2cb_CheckedChanged(sender As Object, e As EventArgs) Handles badOpcode2cb.CheckedChanged
         If badOpcode2cb.Checked = True Then
             badOpcode2valbox.Enabled = True
         Else
@@ -6179,8 +7161,7 @@ Public Class FrmMain
         End If
     End Sub
 
-    Private Sub testScriptbtn_Click(sender As Object, e As EventArgs) Handles testScriptbtn.Click
-
+    Private Sub TestScriptbtn_Click(sender As Object, e As EventArgs) Handles testScriptbtn.Click
         Ex_sender = sender
         Ex_e = e
         scriptFeedBox.Text = ""
@@ -6195,7 +7176,7 @@ Public Class FrmMain
             haltOnFail = False
             scriptFileReader = My.Computer.FileSystem.OpenTextFileReader(tbScriptFile.Text)
             nextScriptTestTime = DateTime.Now.AddMilliseconds(0)     'Execute immediately
-            If testScriptFile(scriptFileReader) <> 0 Then
+            If TestScriptFile(scriptFileReader) <> 0 Then
                 'Device type failed validation
                 scriptFileReader.Close()
                 nextScriptTestTime = New DateTime(1970, 1, 1)
@@ -6208,7 +7189,7 @@ Public Class FrmMain
         End If
     End Sub
 
-    Private Function testScriptFile(scriptFileReader As StreamReader) As Integer
+    Private Function TestScriptFile(scriptFileReader As StreamReader) As Integer
         'This routine reads the data from the script file and executes the commands one at a time
         Dim stringReader As String
         Dim scriptIndex As Integer
@@ -6235,225 +7216,225 @@ Public Class FrmMain
                 testScriptbtn.Enabled = True
                 pbOpenScript.Enabled = True
                 pbKillScript.Enabled = False
-                addToScriptFeed("Test script finished testing: All commands appear valid")
+                AddToScriptFeed("Test script finished testing: All commands appear valid")
                 Return 0
 
             ElseIf (Mid(stringReader, 1, 16) = "AutoCyclingStart") Then
-                addToScriptFeed("Autonomous Cycling Start Command")
+                AddToScriptFeed("Autonomous Cycling Start Command")
                 Return 0
 
             ElseIf (Mid(stringReader, 1, 15) = "AutoCyclingStop") Then
-                addToScriptFeed("Autonomous Cycling Stop Command")
+                AddToScriptFeed("Autonomous Cycling Stop Command")
                 Return 0
 
             ElseIf (Mid(stringReader, 1, 12) = "CriticalPeak") Then
                 Try
-                    i = getParam1int(14, stringReader)
-                    addToScriptFeed("Critical Peak Pricing Event: " + Convert.ToString(i))
+                    i = GetParam1int(14, stringReader)
+                    AddToScriptFeed("Critical Peak Pricing Event: " + Convert.ToString(i))
                     Return 0
                 Catch e As Exception
-                    addToScriptFeed("Critical Peak command on line " + Convert.ToString(testScriptLine) + " has no time parameter!")
+                    AddToScriptFeed("Critical Peak command on line " + Convert.ToString(testScriptLine) + " has no time parameter!")
                 End Try
 
             ElseIf (Mid(stringReader, 1, 5) = "Delay") Then
                 Try
-                    i = getParam1int(7, stringReader)
-                    addToScriptFeed("Delay Command: " + Convert.ToString(i))
+                    i = GetParam1int(7, stringReader)
+                    AddToScriptFeed("Delay Command: " + Convert.ToString(i))
                     Return 0
                 Catch e As Exception
-                    addToScriptFeed("Delay command on line " + Convert.ToString(testScriptLine) + " has no time parameter!")
-                    killScriptTest()
+                    AddToScriptFeed("Delay command on line " + Convert.ToString(testScriptLine) + " has no time parameter!")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 13) = "DeviceInfo") Then
-                addToScriptFeed("Device Info Query Command")
+                AddToScriptFeed("Device Info Query Command")
                 Return 0
 
             ElseIf (Mid(stringReader, 1, 6) = "Device") Then
                 If (Mid(stringReader, 8, 3) = "UCM") Then
-                    addToScriptFeed("Device UCM")
+                    AddToScriptFeed("Device UCM")
                     Return 0
                 ElseIf (Mid(stringReader, 8, 3) = "SGD") Then
-                    addToScriptFeed("Device SGD")
+                    AddToScriptFeed("Device SGD")
                     Return 0
                 Else
-                    addToScriptFeed("Device command at line " + Convert.ToString(testScriptLine) + " is missing device type")
-                    killScriptTest()
+                    AddToScriptFeed("Device command at line " + Convert.ToString(testScriptLine) + " is missing device type")
+                    KillScriptTest()
                     Return 1
                 End If
 
             ElseIf (Mid(stringReader, 1, 13) = "GridEmergency") Then
                 Try
-                    i = getParam1int(15, stringReader)
-                    addToScriptFeed("Grid Emergency Event")
+                    i = GetParam1int(15, stringReader)
+                    AddToScriptFeed("Grid Emergency Event")
                     Return 0
                 Catch e As Exception
-                    addToScriptFeed("Grid Emergency command on line " + Convert.ToString(testScriptLine) + " has no time parameter!")
-                    killScriptTest()
+                    AddToScriptFeed("Grid Emergency command on line " + Convert.ToString(testScriptLine) + " has no time parameter!")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 12) = "GridGuidence") Then
                 Try
-                    i = getParam1int(14, stringReader)
+                    i = GetParam1int(14, stringReader)
                     If i = 1 Or i = 2 Or i = 3 Then
-                        addToScriptFeed("Grid Guidance: " + Convert.ToString(i))
+                        AddToScriptFeed("Grid Guidance: " + Convert.ToString(i))
                         Return 0
                     Else
-                        addToScriptFeed("Grid Guidance command on line " + Convert.ToString(testScriptLine) + " does not have a valid parameter (guidance number)")
-                        killScriptTest()
+                        AddToScriptFeed("Grid Guidance command on line " + Convert.ToString(testScriptLine) + " does not have a valid parameter (guidance number)")
+                        KillScriptTest()
                         Return 1
                     End If
 
                 Catch e As Exception
-                    addToScriptFeed("Grid Guidance command on line " + Convert.ToString(testScriptLine) + " does not have a parameter!")
-                    killScriptTest()
+                    AddToScriptFeed("Grid Guidance command on line " + Convert.ToString(testScriptLine) + " does not have a parameter!")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 10) = "HaltOnFail") Then
-                addToScriptFeed("Halt on Fail: True")
+                AddToScriptFeed("Halt on Fail: True")
                 Return 0
 
             ElseIf (Mid(stringReader, 1, 9) = "LoadUpEnd") Then
-                addToScriptFeed("Load Up Event Terminate")
+                AddToScriptFeed("Load Up Event Terminate")
                 Return 0
 
             ElseIf (Mid(stringReader, 1, 6) = "LoadUp") Then
                 Try
-                    i = getParam1int(8, stringReader)
-                    addToScriptFeed("Load Up Event")
+                    i = GetParam1int(8, stringReader)
+                    AddToScriptFeed("Load Up Event")
                     Return 0
                 Catch e As Exception
-                    addToScriptFeed("Load Up command on line " + Convert.ToString(testScriptLine) + " has no time parameter!")
-                    killScriptTest()
+                    AddToScriptFeed("Load Up command on line " + Convert.ToString(testScriptLine) + " has no time parameter!")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 10) = "LogComment") Then
                 Try
-                    addToScriptFeed(Mid(stringReader, 12, stringReader.Length - 11))
+                    AddToScriptFeed(Mid(stringReader, 12, stringReader.Length - 11))
                     Return 0
                 Catch e As Exception
-                    addToScriptFeed("Log Comment command on line " + Convert.ToString(testScriptLine) + " has no comment!")
-                    killScriptTest()
+                    AddToScriptFeed("Log Comment command on line " + Convert.ToString(testScriptLine) + " has no comment!")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 14) = "ManualValidate") Then
-                addToScriptFeed("Manual Validate Command")
+                AddToScriptFeed("Manual Validate Command")
                 Return 0
 
             ElseIf (Mid(stringReader, 1, 14) = "MsgTypeSupport") Then
                 scriptIndex = 16
                 Try
-                    i = getParam1int(scriptIndex, stringReader)
-                    j = getParam1int(scriptIndex, stringReader)
-                    addToScriptFeed("Message Type Support Query Command " + Convert.ToString(i) + " " + Convert.ToString(j))
+                    i = GetParam1int(scriptIndex, stringReader)
+                    j = GetParam1int(scriptIndex, stringReader)
+                    AddToScriptFeed("Message Type Support Query Command " + Convert.ToString(i) + " " + Convert.ToString(j))
                     Return 0
                 Catch e As Exception
-                    addToScriptFeed("Message Type Supported Query command on line " + Convert.ToString(testScriptLine) + " does not have a valid number of parameters!")
-                    killScriptTest()
+                    AddToScriptFeed("Message Type Supported Query command on line " + Convert.ToString(testScriptLine) + " does not have a valid number of parameters!")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 12) = "NextRelPrice") Then
                 Try
-                    i = getParam1int(14, stringReader)
-                    addToScriptFeed("Next Relative Price ratio: " + Convert.ToString(i))
+                    i = GetParam1int(14, stringReader)
+                    AddToScriptFeed("Next Relative Price ratio: " + Convert.ToString(i))
                     Return 0
                 Catch e As Exception
-                    addToScriptFeed("Next Relative Price command on line " + Convert.ToString(testScriptLine) + " has no parameter!")
-                    killScriptTest()
+                    AddToScriptFeed("Next Relative Price command on line " + Convert.ToString(testScriptLine) + " has no parameter!")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 5) = "Pause") Then
                 Try
-                    addToScriptFeed(Mid(stringReader, 7, stringReader.Length - 6))
+                    AddToScriptFeed(Mid(stringReader, 7, stringReader.Length - 6))
                     Return 0
                 Catch e As Exception
-                    addToScriptFeed("Pause command on line " + Convert.ToString(testScriptLine) + " has no valid comment!")
-                    killScriptTest()
+                    AddToScriptFeed("Pause command on line " + Convert.ToString(testScriptLine) + " has no valid comment!")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 12) = "PresRelPrice") Then
                 Try
-                    i = getParam1int(14, stringReader)
-                    addToScriptFeed("Present Relative Price ratio: " + Convert.ToString(i))
+                    i = GetParam1int(14, stringReader)
+                    AddToScriptFeed("Present Relative Price ratio: " + Convert.ToString(i))
                     Return 0
                 Catch e As Exception
-                    addToScriptFeed("Present Relative Price command on line " + Convert.ToString(testScriptLine) + " has no parameter!")
-                    killScriptTest()
+                    AddToScriptFeed("Present Relative Price command on line " + Convert.ToString(testScriptLine) + " has no parameter!")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 12) = "QueryOpState") Then
-                addToScriptFeed("Query Operating State")
+                AddToScriptFeed("Query Operating State")
                 Return 0
 
             ElseIf (Mid(stringReader, 1, 13) = "ReqPowerLevel") Then
                 Try
-                    i = getParam1int(15, stringReader)
-                    addToScriptFeed("Request Power Level ratio: " + Convert.ToString(i))
+                    i = GetParam1int(15, stringReader)
+                    AddToScriptFeed("Request Power Level ratio: " + Convert.ToString(i))
                     Return 0
                 Catch e As Exception
-                    addToScriptFeed("Request Power Level command on line " + Convert.ToString(testScriptLine) + " has no parameter!")
-                    killScriptTest()
+                    AddToScriptFeed("Request Power Level command on line " + Convert.ToString(testScriptLine) + " has no parameter!")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 9) = "RunNormal") Then
-                addToScriptFeed("End Shed/Run Normal")
+                AddToScriptFeed("End Shed/Run Normal")
                 Return 0
 
             ElseIf (Mid(stringReader, 1, 10) = "SetUTCTime") Then
                 scriptIndex = 12
                 Try
-                    i = getParam1int(scriptIndex, stringReader)
-                    j = getParam1int(scriptIndex, stringReader)
-                    addToScriptFeed("Set UTC Time command. UTC offset: " + Convert.ToString(i) + "   STO offset: " + Convert.ToString(j))
+                    i = GetParam1int(scriptIndex, stringReader)
+                    j = GetParam1int(scriptIndex, stringReader)
+                    AddToScriptFeed("Set UTC Time command. UTC offset: " + Convert.ToString(i) + "   STO offset: " + Convert.ToString(j))
                     Return 0
                 Catch e As Exception
-                    addToScriptFeed("UTC Time command on line " + Convert.ToString(testScriptLine) + " has incorrect number of parameters!")
-                    killScriptTest()
+                    AddToScriptFeed("UTC Time command on line " + Convert.ToString(testScriptLine) + " has incorrect number of parameters!")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 4) = "Shed") Then
                 Try
-                    i = getParam1int(6, stringReader)
-                    addToScriptFeed("Shed Event: " + Convert.ToString(i))
+                    i = GetParam1int(6, stringReader)
+                    AddToScriptFeed("Shed Event: " + Convert.ToString(i))
                     Return 0
                 Catch e As Exception
-                    addToScriptFeed("Shed Event command on line " + Convert.ToString(testScriptLine) + " has no time parameter!")
-                    killScriptTest()
+                    AddToScriptFeed("Shed Event command on line " + Convert.ToString(testScriptLine) + " has no time parameter!")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 10) = "TimeRemain") Then
                 Try
-                    i = getParam1int(12, stringReader)
-                    addToScriptFeed("Time Remaining: " + Convert.ToString(i))
+                    i = GetParam1int(12, stringReader)
+                    AddToScriptFeed("Time Remaining: " + Convert.ToString(i))
                     Return 0
                 Catch e As Exception
-                    addToScriptFeed("Time Remaining command on line " + Convert.ToString(testScriptLine) + " has no time parameter!")
-                    killScriptTest()
+                    AddToScriptFeed("Time Remaining command on line " + Convert.ToString(testScriptLine) + " has no time parameter!")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 9) = "BadOpCode") Then
                 scriptIndex = 11
                 Try
-                    i = getParam1int(scriptIndex, stringReader)
-                    j = getParam1int(scriptIndex, stringReader)
-                    addToScriptFeed("Bad Opcode. Opcode 1: " + Convert.ToString(i) + "   Opcode 2: " + Convert.ToString(j))
+                    i = GetParam1int(scriptIndex, stringReader)
+                    j = GetParam1int(scriptIndex, stringReader)
+                    AddToScriptFeed("Bad Opcode. Opcode 1: " + Convert.ToString(i) + "   Opcode 2: " + Convert.ToString(j))
                     Return 0
                 Catch e As Exception
-                    addToScriptFeed("Bad Opcode command on line " + Convert.ToString(testScriptLine) + " has incorrect number of parameters")
-                    killScriptTest()
+                    AddToScriptFeed("Bad Opcode command on line " + Convert.ToString(testScriptLine) + " has incorrect number of parameters")
+                    KillScriptTest()
                     Return 1
                 End Try
 
@@ -6462,34 +7443,34 @@ Public Class FrmMain
                     scriptIndex = 15
                     paramCount = 0
                     Do While scriptIndex <= stringReader.Length
-                        i = getParam1int(scriptIndex, stringReader)
+                        i = GetParam1int(scriptIndex, stringReader)
                         paramCount += 1
                     Loop
                     If paramCount Mod 2 = 1 Then
-                        addToScriptFeed("Custom command on line " + Convert.ToString(testScriptLine) + " has an odd number of parameters!")
-                        killScriptTest()
+                        AddToScriptFeed("Custom command on line " + Convert.ToString(testScriptLine) + " has an odd number of parameters!")
+                        KillScriptTest()
                         Return 1
                     ElseIf paramCount = 0 Then
-                        addToScriptFeed("Custom command on line " + Convert.ToString(testScriptLine) + " has no parameters!")
-                        killScriptTest()
+                        AddToScriptFeed("Custom command on line " + Convert.ToString(testScriptLine) + " has no parameters!")
+                        KillScriptTest()
                         Return 1
                     Else
-                        addToScriptFeed("Custom command")
+                        AddToScriptFeed("Custom command")
                         Return 0
                     End If
 
                 Catch e As Exception
-                    addToScriptFeed("Custom command on line " + Convert.ToString(testScriptLine) + " has incorrect number of parameters")
-                    killScriptTest()
+                    AddToScriptFeed("Custom command on line " + Convert.ToString(testScriptLine) + " has incorrect number of parameters")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 18) = "ResetCustomCommand") Then
-                addToScriptFeed("ResetCustomCommand")
+                AddToScriptFeed("ResetCustomCommand")
                 Return 0
 
             ElseIf (Mid(stringReader, 1, 14) = "ResetBadOpCode") Then
-                addToScriptFeed("Reset Bad Opcode")
+                AddToScriptFeed("Reset Bad Opcode")
                 Return 0
 
             ElseIf (Mid(stringReader, 1, 14) = "ValidateResult") Then
@@ -6498,25 +7479,25 @@ Public Class FrmMain
                 Try
                     'Loop through arguments and add them to arrays for processing
                     Do While scriptIndex <= stringReader.Length
-                        i = getParam1int(scriptIndex, stringReader)
+                        i = GetParam1int(scriptIndex, stringReader)
                         paramCount += 1
                     Loop
                     If paramCount Mod 2 = 1 Then
-                        addToScriptFeed("Validate Result command on line " + Convert.ToString(testScriptLine) + " has an odd number of parameters!")
-                        killScriptTest()
+                        AddToScriptFeed("Validate Result command on line " + Convert.ToString(testScriptLine) + " has an odd number of parameters!")
+                        KillScriptTest()
                         Return 1
                     ElseIf paramCount = 0 Then
-                        addToScriptFeed("Validate Result command on line " + Convert.ToString(testScriptLine) + " has no parameters!")
-                        killScriptTest()
+                        AddToScriptFeed("Validate Result command on line " + Convert.ToString(testScriptLine) + " has no parameters!")
+                        KillScriptTest()
                         Return 1
                     Else
-                        addToScriptFeed("Validate Result command")
+                        AddToScriptFeed("Validate Result command")
                         Return 0
                     End If
 
                 Catch e As Exception
-                    addToScriptFeed("Validate Result command on line " + Convert.ToString(testScriptLine) + " has incorrect number of parameters")
-                    killScriptTest()
+                    AddToScriptFeed("Validate Result command on line " + Convert.ToString(testScriptLine) + " has incorrect number of parameters")
+                    KillScriptTest()
                     Return 1
                 End Try
 
@@ -6524,30 +7505,197 @@ Public Class FrmMain
                 'Set the status type
                 Try
                     If (Mid(stringReader, 12, 4) = "Good") Then     'Send Comm Good Message
-                        addToScriptFeed("Comm Status: Good Command")
+                        AddToScriptFeed("Comm Status: Good Command")
                     ElseIf (Mid(stringReader, 12, 4) = "None") Then 'Send Comm Bad Message
-                        addToScriptFeed("Comm Status: None Command")
+                        AddToScriptFeed("Comm Status: None Command")
                     ElseIf (Mid(stringReader, 12, 4) = "Poor") Then 'Send Comm Poor Message
-                        addToScriptFeed("Comm Status: Poor Command")
+                        AddToScriptFeed("Comm Status: Poor Command")
                     Else
-                        addToScriptFeed("Comm Status command on line " + Convert.ToString(testScriptLine) + " has invalid parameters")
-                        killScriptTest()
+                        AddToScriptFeed("Comm Status command on line " + Convert.ToString(testScriptLine) + " has invalid parameters")
+                        KillScriptTest()
                     End If
-                    i = getParam1int(17, stringReader)
+                    i = GetParam1int(17, stringReader)
                     Return 0
                 Catch ex As Exception
-                    addToScriptFeed("Comm Status command on on line " + Convert.ToString(testScriptLine) + " has invalid parameters")
-                    killScriptTest()
+                    AddToScriptFeed("Comm Status command on on line " + Convert.ToString(testScriptLine) + " has invalid parameters")
+                    KillScriptTest()
                     Return 1
                 End Try
 
             ElseIf (Mid(stringReader, 1, 15) = "QueryMaxPayload") Then  'Send a Max Payload Query
-                addToScriptFeed("Max Payload query")
+                AddToScriptFeed("Max Payload query")
                 Return 0
 
+            ElseIf (Mid(stringReader, 1, 13) = "ReqPowerLimit") Then  'Send a Power Limit Request
+                Try
+                    i = GetParam1int(15, stringReader)
+                    AddToScriptFeed("Request Power Limit")
+                    Return 0
+                Catch ex As Exception
+                    AddToScriptFeed("Request Power Limit command on on line " + Convert.ToString(testScriptLine) + " has invalid parameters")
+                    KillScriptTest()
+                    Return 1
+                End Try
+
+            ElseIf (Mid(stringReader, 1, 12) = "QueryOpStateResp") Then
+                AddToScriptFeed("Sent Query Operating State response")
+                Return 0
+
+
+            ElseIf (Mid(stringReader, 1, 17) = "SendPendEventTime") Then
+                Try
+                    i = GetParam1int(19, stringReader)
+                    AddToScriptFeed("Sent Pending Event Time")
+                    Return 0
+                Catch ex As Exception
+                    AddToScriptFeed("Pending Event Time command on on line " + Convert.ToString(testScriptLine) + " has invalid parameters")
+                    KillScriptTest()
+                    Return 1
+                End Try
+
+            ElseIf (Mid(stringReader, 1, 17) = "SendPendEventType") Then
+                Try
+                    i = GetParam1int(19, stringReader)
+                    AddToScriptFeed("Sent Pending Event Type")
+                    Return 0
+                Catch ex As Exception
+                    AddToScriptFeed("Pending Event Type command on on line " + Convert.ToString(testScriptLine) + " has invalid parameters")
+                    KillScriptTest()
+                    Return 1
+                End Try
+
+            ElseIf (Mid(stringReader, 1, 6) = "Reboot") Then
+                Try
+                    i = GetParam1int(8, stringReader)
+                    AddToScriptFeed("Reboot Request")
+                    Return 0
+                Catch ex As Exception
+                    AddToScriptFeed("Reboot command on on line " + Convert.ToString(testScriptLine) + " has invalid parameters")
+                    KillScriptTest()
+                    Return 1
+                End Try
+
+            ElseIf (Mid(stringReader, 1, 14) = "GetEnergyPrice") Then
+                AddToScriptFeed("Sent Get Energy Price Request")
+                Return 0
+
+
+            ElseIf (Mid(stringReader, 1, 14) = "SetEnergyPrice") Then
+                AddToScriptFeed("Sent Set Energy Price Request")
+                Return 0
+
+
+            ElseIf (Mid(stringReader, 1, 13) = "SetTempOffset") Then
+                Try
+                    i = GetParam1int(15, stringReader)
+                    AddToScriptFeed("Sent Set Temperature Offset Request")
+                    Return 0
+                Catch ex As Exception
+                    AddToScriptFeed("Set Temperature Offset command on on line " + Convert.ToString(testScriptLine) + " has invalid parameters")
+                    KillScriptTest()
+                    Return 1
+                End Try
+
+            ElseIf (Mid(stringReader, 1, 13) = "GetTempOffset") Then
+                AddToScriptFeed("Sent Get Temperature Offset Request")
+                Return 0
+
+
+            ElseIf (Mid(stringReader, 1, 15) = "SetTempSetpoint") Then
+                Try
+                    i = GetParam1int(17, stringReader)
+                    i = GetParam1int(23, stringReader)
+                    i = GetParam1int(29, stringReader)
+                    AddToScriptFeed("Sent Set Temperature Setpoint Request")
+                    Return 0
+                Catch ex As Exception
+                    AddToScriptFeed("Set Temperature Setpoint command on on line " + Convert.ToString(testScriptLine) + " has invalid parameters")
+                    KillScriptTest()
+                    Return 1
+                End Try
+
+            ElseIf (Mid(stringReader, 1, 15) = "GetTempSetpoint") Then
+                AddToScriptFeed("Sent Get Temperature Setpoint Request")
+                Return 0
+
+
+            ElseIf (Mid(stringReader, 1, 11) = "GetPresTemp") Then
+                AddToScriptFeed("Get Present Temperature Request")
+                Return 0
+
+
+            ElseIf (Mid(stringReader, 1, 12) = "CommodityGet") Then
+                Try
+                    i = GetParam1int(14, stringReader)
+                    AddToScriptFeed("Get Commodity")
+                    Return 0
+                Catch ex As Exception
+                    AddToScriptFeed("Get Commodity command on on line " + Convert.ToString(testScriptLine) + " has invalid parameters")
+                    KillScriptTest()
+                    Return 1
+                End Try
+
+            ElseIf (Mid(stringReader, 1, 13) = "ActivationGet") Then
+                AddToScriptFeed("Sent Get Activation command")
+                Return 0
+
+
+            ElseIf (Mid(stringReader, 1, 13) = "ActivationSet") Then
+                AddToScriptFeed("Sent Set Activation command")
+                Return 0
+
+
+            ElseIf (Mid(stringReader, 1, 16) = "UserPrefLevelGet") Then
+                AddToScriptFeed("Sent Get User Preference Level command")
+                Return 0
+
+
+            ElseIf (Mid(stringReader, 1, 16) = "UserPrefLevelSet") Then
+                AddToScriptFeed("Sent Set User Preference Level command")
+                Return 0
+
+
+            ElseIf (Mid(stringReader, 1, 20) = "SetInterResponseCode") Then
+                Try
+                    i = GetParam1int(22, stringReader)
+                    AddToScriptFeed("Set default intermediate command response code")
+                    Return 0
+                Catch ex As Exception
+                    AddToScriptFeed("Set Intermediate Response Code command on on line " + Convert.ToString(testScriptLine) + " has invalid parameters")
+                    KillScriptTest()
+                    Return 1
+                End Try
+
+            ElseIf (Mid(stringReader, 1, 9) = "RawPacket") Then ' Send Raw Packet to other device
+                Try
+                    scriptIndex = 11
+                    paramCount = 0
+                    Do While scriptIndex <= stringReader.Length
+                        i = GetParam1int(scriptIndex, stringReader)
+                        paramCount += 1
+                    Loop
+                    If paramCount < 4 Then
+                        AddToScriptFeed("Raw packet on line " + Convert.ToString(testScriptLine) + " has to few bytes!")
+                        KillScriptTest()
+                        Return 1
+                    ElseIf paramCount = 0 Then
+                        AddToScriptFeed("Raw packet on line " + Convert.ToString(testScriptLine) + " has no parameters!")
+                        KillScriptTest()
+                        Return 1
+                    Else
+                        AddToScriptFeed("Sending Raw packet")
+                        Return 0
+                    End If
+
+                Catch e As Exception
+                    AddToScriptFeed("Raw packet on line " + Convert.ToString(testScriptLine) + " has incorrect number of parameters")
+                    KillScriptTest()
+                    Return 1
+                End Try
+
             Else
-                killScriptTest()
-                addToScriptFeed("Undefined command in test script line " + Convert.ToString(testScriptLine))
+                KillScriptTest()
+                AddToScriptFeed("Undefined command in test script line " + Convert.ToString(testScriptLine))
                 Return -1
             End If
             Return 0
@@ -6559,7 +7707,7 @@ Public Class FrmMain
 
     End Function
 
-    Private Sub killScriptTest()
+    Private Sub KillScriptTest()
         scriptFileReader.Close()
         nextScriptTestTime = New DateTime(1970, 1, 1)
         pbKillScript.Enabled = False
@@ -6569,7 +7717,7 @@ Public Class FrmMain
     End Sub
 
 
-    Private Sub customMsgType1cb_CheckedChanged(sender As Object, e As EventArgs) Handles customMsgType1cb.CheckedChanged
+    Private Sub CustomMsgType1cb_CheckedChanged(sender As Object, e As EventArgs) Handles customMsgType1cb.CheckedChanged
         If customMsgType1cb.Checked = True Then
             customMsgType1ValBox.Enabled = True
         Else
@@ -6577,7 +7725,7 @@ Public Class FrmMain
         End If
     End Sub
 
-    Private Sub customMsgType2cb_CheckedChanged(sender As Object, e As EventArgs) Handles customMsgType2cb.CheckedChanged
+    Private Sub CustomMsgType2cb_CheckedChanged(sender As Object, e As EventArgs) Handles customMsgType2cb.CheckedChanged
         If customMsgType2cb.Checked = True Then
             customMsgType2ValBox.Enabled = True
         Else
@@ -6585,7 +7733,7 @@ Public Class FrmMain
         End If
     End Sub
 
-    Private Sub customLength1cb_CheckedChanged(sender As Object, e As EventArgs) Handles customLength1cb.CheckedChanged
+    Private Sub CustomLength1cb_CheckedChanged(sender As Object, e As EventArgs) Handles customLength1cb.CheckedChanged
         If customLength1cb.Checked = True Then
             customLength1ValBox.Enabled = True
         Else
@@ -6593,7 +7741,7 @@ Public Class FrmMain
         End If
     End Sub
 
-    Private Sub customLength2cb_CheckedChanged(sender As Object, e As EventArgs) Handles customLength2cb.CheckedChanged
+    Private Sub CustomLength2cb_CheckedChanged(sender As Object, e As EventArgs) Handles customLength2cb.CheckedChanged
         If customLength2cb.Checked = True Then
             customLength2ValBox.Enabled = True
         Else
@@ -6601,7 +7749,7 @@ Public Class FrmMain
         End If
     End Sub
 
-    Private Sub pbSetSetPoint_Click(sender As Object, e As EventArgs) Handles pbSetSetPoint.Click
+    Private Sub PbSetSetPoint_Click(sender As Object, e As EventArgs) Handles pbSetSetPoint.Click
         Dim xmitBuffer(16) As Byte
 
         'Clear response boxes
@@ -6649,7 +7797,7 @@ Public Class FrmMain
         receiveIndex = 0
     End Sub
 
-    Private Sub pbRequestSetpoint_Click(sender As Object, e As EventArgs) Handles pbRequestSetpoint.Click
+    Private Sub PbRequestSetpoint_Click(sender As Object, e As EventArgs) Handles pbRequestSetpoint.Click
         Dim xmitBuffer(16) As Byte
 
         'Clear response boxes
@@ -6675,7 +7823,7 @@ Public Class FrmMain
     End Sub
 
 
-    Private Sub pbBrowsePT_Click(sender As Object, e As EventArgs) Handles pbBrowsePT.Click
+    Private Sub PbBrowsePT_Click(sender As Object, e As EventArgs) Handles pbBrowsePT.Click
         Try
             If OpenFileDialog1.ShowDialog() = DialogResult.OK Then
                 tbFilePathPT.Text = OpenFileDialog1.FileName
@@ -6686,15 +7834,15 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub pbSendPT_Click(sender As Object, e As EventArgs) Handles pbSendPT.Click
+    Private Sub PbSendPT_Click(sender As Object, e As EventArgs) Handles pbSendPT.Click
         Dim xmitBuffer(512) As Byte
-        Dim i, length, count As Integer
+        Dim idx, length, count As Integer
 
-        i = 0
+        idx = 0
         If cbAddWrapper.Checked = True Then
             xmitBuffer(0) = 9
             xmitBuffer(1) = cbProtocolPT.SelectedIndex
-            i = 4
+            idx = 4
         End If
         Dim BinaryFile As New FileStream(tbFilePathPT.Text, FileMode.Open, FileAccess.Read)
         Dim Reader As New BinaryReader(BinaryFile)
@@ -6702,19 +7850,22 @@ Public Class FrmMain
         BinaryFile.Seek(0, SeekOrigin.Begin)
         count = 0
         While count < length
-            xmitBuffer(i) = Reader.ReadByte()
+            If xmitBuffer.Length = idx Then
+                Array.Resize(xmitBuffer, idx + 2) 'Extend buffer's with minimum payload size 
+            End If
+            xmitBuffer(idx) = Reader.ReadByte()
             count += 1
-            i += 1
+            idx += 1
         End While
         BinaryFile.Close()
         If cbAddWrapper.Checked = True Then
             xmitBuffer(2) = length >> 8
             xmitBuffer(3) = length And &HFF
-            SendComData(xmitBuffer, length + 4, "Sent Pass Through Message", pendingLinkAck)
+            SendComData(xmitBuffer, idx, "Sent Pass Through Message", pendingLinkAck)
             expectingResponse = False
             pendingLinkAck = True
         Else
-            SendComData(xmitBuffer, length, "Raw Message", pendingLinkAck)
+            SendComData(xmitBuffer, idx, "Raw Message", pendingLinkAck)
             expectingResponse = False
             pendingLinkAck = True
         End If
@@ -6722,7 +7873,7 @@ Public Class FrmMain
         receiveIndex = 0
     End Sub
 
-    Private Sub lbCommodityCode1_SelectedIndexChanged(sender As Object, e As EventArgs) Handles lbCommodityCode1.SelectedIndexChanged
+    Private Sub LbCommodityCode1_SelectedIndexChanged(sender As Object, e As EventArgs) Handles lbCommodityCode1.SelectedIndexChanged
 
         tbCommodityRate.Text = commodityArray2(lbCommodityCode1.SelectedIndex).instRate
         tbCommodityAmount.Text = commodityArray2(lbCommodityCode1.SelectedIndex).cumAmount
@@ -6733,7 +7884,7 @@ Public Class FrmMain
     End Sub
 
 
-    Private Sub pbGetEnergyPrice_Click(sender As Object, e As EventArgs) Handles pbGetEnergyPrice.Click
+    Private Sub PbGetEnergyPrice_Click(sender As Object, e As EventArgs) Handles pbGetEnergyPrice.Click
         Dim xmitBuffer(10) As Byte
 
         'Build Msg
@@ -6751,36 +7902,48 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub pbSetEnergyPrice_Click(sender As Object, e As EventArgs) Handles pbSetEnergyPrice.Click
-        Dim xmitBuffer(20) As Byte
+    Private Sub PbSetEnergyPrice_Click(sender As Object, e As EventArgs) Handles pbSetEnergyPrice.Click
+        Dim xmitBuffer(32) As Byte
+        Dim uTime As Integer
+        Dim startDate As New DateTime(1970, 1, 1, 0, 0, 0)
 
         'Build Msg
         xmitBuffer(0) = 8
         xmitBuffer(1) = 2
         xmitBuffer(2) = 0
-        xmitBuffer(3) = 13
+        xmitBuffer(3) = 17
         xmitBuffer(4) = 3
         xmitBuffer(5) = 0
-        xmitBuffer(6) = &H7       'Current price 1800 $0.18)
-        xmitBuffer(7) = &H8
-        xmitBuffer(8) = &H3     'Currency code
-        xmitBuffer(9) = &H48
-        xmitBuffer(10) = 4      'Digita after decimal
-        xmitBuffer(11) = &H1B   'Expire time/date 1/1/2000
-        xmitBuffer(12) = &HCE
-        xmitBuffer(13) = &H96
-        xmitBuffer(14) = &H5C
-        xmitBuffer(15) = &H4   'Next price 1200 ($0.12)
-        xmitBuffer(16) = &HB0
+        xmitBuffer(6) = (nudCurrentPrice.Value >> 24) And &HFF     'Current price
+        xmitBuffer(7) = (nudCurrentPrice.Value >> 16) And &HFF
+        xmitBuffer(8) = (nudCurrentPrice.Value >> 8) And &HFF
+        xmitBuffer(9) = nudCurrentPrice.Value And &HFF
+        xmitBuffer(10) = (nudCurrencyCode.Value >> 8) And &HFF     'Currency code
+        xmitBuffer(11) = nudCurrencyCode.Value And &HFF
+        xmitBuffer(12) = nudDigitsAfterDecimal.Value      'Digits after decimal
 
+        'Build expiration time
+        uTime = (dtpExpTime.Value - startDate).TotalSeconds
+        If uTime < 946684800 Then
+            uTime = 946684800
+        End If
+        uTime -= 946684800      'Conver Unix time to seconds since 1/1/2000
+        xmitBuffer(16) = uTime And &HFF
+        xmitBuffer(15) = (uTime >> 8) And &HFF
+        xmitBuffer(14) = (uTime >> 16) And &HFF
+        xmitBuffer(13) = (uTime >> 24) And &HFF
+        xmitBuffer(17) = (nudNextPrice.Value >> 24) And &HFF   'Next price
+        xmitBuffer(18) = (nudNextPrice.Value >> 16) And &HFF
+        xmitBuffer(19) = (nudNextPrice.Value >> 8) And &HFF
+        xmitBuffer(20) = nudNextPrice.Value And &HFF
         'Send Msg
         pendingLinkAck = True
-        SendComData(xmitBuffer, 17, "Sent Set Energy Price Request", pendingLinkAck)
+        SendComData(xmitBuffer, 21, "Sent Set Energy Price Request", pendingLinkAck)
         expectingResponse = True
 
     End Sub
 
-    Private Sub pfGetTier_Click(sender As Object, e As EventArgs) Handles pfGetTier.Click
+    Private Sub PfGetTier_Click(sender As Object, e As EventArgs) Handles pfGetTier.Click
         Dim xmitBuffer(10) As Byte
 
         'Build Msg
@@ -6798,7 +7961,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub pbSetTier_Click(sender As Object, e As EventArgs) Handles pbSetTier.Click
+    Private Sub PbSetTier_Click(sender As Object, e As EventArgs) Handles pbSetTier.Click
         Dim xmitBuffer(20) As Byte
 
         'Build Msg
@@ -6822,7 +7985,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub chkShortMsg_CheckedChanged(sender As Object, e As EventArgs) Handles chkShortMsg.CheckedChanged
+    Private Sub ChkShortMsg_CheckedChanged(sender As Object, e As EventArgs) Handles chkShortMsg.CheckedChanged
         If chkShortMsg.Checked = True Then
             useShortMsg = True
         Else
@@ -6831,7 +7994,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub cbNakMsg_CheckedChanged(sender As Object, e As EventArgs) Handles cbNakMsg.CheckedChanged
+    Private Sub CbNakMsg_CheckedChanged(sender As Object, e As EventArgs) Handles cbNakMsg.CheckedChanged
         forceNak = True
         If cbNakMsg.Checked = True Then
             forceNak = True
@@ -6841,7 +8004,7 @@ Public Class FrmMain
 
     End Sub
 
-    Private Sub msgSupportQuery_Enter(sender As Object, e As EventArgs)
+    Private Sub MsgSupportQuery_Enter(sender As Object, e As EventArgs)
         RefreshODMsgList()
     End Sub
 
@@ -6862,7 +8025,7 @@ Public Class FrmMain
         Next
     End Sub
 
-    Private Sub pbGetPresentTemp_Click(sender As Object, e As EventArgs) Handles pbGetPresentTemp.Click
+    Private Sub PbGetPresentTemp_Click(sender As Object, e As EventArgs) Handles pbGetPresentTemp.Click
         Dim xmitBuffer(8) As Byte
         'Get Present Temperature Read Request
         Try
@@ -6891,5 +8054,810 @@ Public Class FrmMain
 
     End Sub
 
+    Private Sub Button2_Click(sender As Object, e As EventArgs) Handles Button2.Click
+        Dim deviceFileReader As System.IO.StreamReader
+        Dim stringReader As String
+        Dim i As Int32
 
+        Try
+            If fbdScriptFileSelect.ShowDialog() = DialogResult.OK Then
+                tbRealDevice.Text = fbdScriptFileSelect.FileName
+            End If
+
+            Ex_sender = sender
+            Ex_e = e
+            'Check that the file exists
+            If My.Computer.FileSystem.FileExists(tbRealDevice.Text) Then
+                deviceFileReader = My.Computer.FileSystem.OpenTextFileReader(tbRealDevice.Text)
+
+                For i = 0 To 1439
+                    stringReader = deviceFileReader.ReadLine()
+                    realDeviceData(i) = Convert.ToInt32(stringReader)
+                Next
+                deviceFileReader.Close()
+            Else
+                MsgBox("No valid data file!")
+            End If
+
+        Catch ex As Exception
+            MessageBox.Show("Error occured in Sub Button2_Click: " & ex.Message)
+        End Try
+    End Sub
+
+    Private Sub Timer1Min_Tick(sender As Object, e As EventArgs) Handles Timer1Min.Tick
+
+    End Sub
+
+    Private Sub BRealDeviceRun_Click(sender As Object, e As EventArgs) Handles bRealDeviceRun.Click
+        If bRealDeviceRun.Text = "Run" Then
+            cbResponseSim.Checked = True
+            If tbRealDevice.Text = "" Then
+                MsgBox("No data file selected!")
+                Return
+            End If
+            If CheckSupported(8, 2) = False Then
+                supportedMsgTypeList.Items.Add("0x8 0x2")
+            End If
+            If CheckSupported(8, 3) = False Then
+                supportedMsgTypeList.Items.Add("0x8 0x3")
+            End If
+            If cbPoolPump.Checked = True Then
+                nudStartDelay.Value = realDeviceData(0)
+                nudPPRunMin.Value = realDeviceData(1)
+                nudTotalCapacity.Value = nudRunNormPwr.Value * realDeviceData(1)
+            End If
+            If cbPVInv.Checked = True Then
+                OpStateBox.SelectedIndex = 1        'PV inverter is always in run mode
+            Else
+                OpStateBox.SelectedIndex = 0        'All other devices types go to idle normal
+            End If
+            bRealDeviceRun.Text = "Stop"
+            nudDataFileIndex.Value = 0
+            nudRealDevMin.Value = 0
+            If cbPVInv.Checked = True Then
+                commodityArray(1).supported = True
+                commodityArray(1).estimated = False
+                nudTotalCapacity.Value = 0
+                nudPresentCapacity.Value = 0
+            Else
+                commodityArray(0).supported = True
+                commodityArray(0).estimated = True
+                commodityArray(6).supported = True
+                commodityArray(6).estimated = True
+                commodityArray(7).supported = True
+                commodityArray(7).estimated = True
+                commodityArray(0).cumAmount = 0
+                commodityArray(0).instRate = 0
+                commodityArray(6).cumAmount = nudTotalCapacity.Value / 60
+                commodityArray(7).cumAmount = nudPresentCapacity.Value / 60
+            End If
+            nudDataFileIndex.Value = 0
+            Timer1Min.Enabled = True
+        Else
+            bRealDeviceRun.Text = "Run"
+            Timer1Min.Enabled = False
+            nudDataFileIndex.Value = 0
+        End If
+    End Sub
+
+    Private Sub CbPoolPump_CheckedChanged(sender As Object, e As EventArgs) Handles cbPoolPump.CheckedChanged
+        If cbPoolPump.Checked = True Then
+            cbHVAC.Checked = False
+            cbHotWater.Checked = False
+            cbPVInv.Checked = False
+        End If
+    End Sub
+
+    Private Sub CbHVAC_CheckedChanged(sender As Object, e As EventArgs) Handles cbHVAC.CheckedChanged
+        If cbHVAC.Checked = True Then
+            cbPoolPump.Checked = False
+            cbHotWater.Checked = False
+            cbPVInv.Checked = False
+        End If
+    End Sub
+
+    Private Sub CbHotWater_CheckedChanged(sender As Object, e As EventArgs) Handles cbHotWater.CheckedChanged
+        If cbHotWater.Checked = True Then
+            cbPoolPump.Checked = False
+            cbHVAC.Checked = False
+            cbPVInv.Checked = False
+        End If
+    End Sub
+
+    Private Sub CbPVInv_CheckedChanged(sender As Object, e As EventArgs) Handles cbPVInv.CheckedChanged
+        If cbPVInv.Checked = True Then
+            cbPoolPump.Checked = False
+            cbHVAC.Checked = False
+            cbHotWater.Checked = False
+        End If
+    End Sub
+
+    Private Sub LogCommentBtn_Click(sender As Object, e As EventArgs) Handles LogCommentBtn.Click
+        'adds comments to the log with timestamp while remaining in simulation
+        Try
+            'log comment textbox then clear it
+            Dim Now As DateTime = DateTime.Now
+            Dim timeStr As String = DateDiff("s", #1/1/2000#, Now) & Now.ToString(".fff")
+            Dim tempstring = (((Convert.ToDecimal(timeStr)) / 86400) + 36526).ToString
+            Dim commentStr As String = timeStr & ", " & tempstring & ", Comment,,, " & LogCommentsTB.Text
+
+            SendToLog("", commentStr)
+
+            LogCommentsTB.Text = ""
+
+        Catch ex As Exception
+            MessageBox.Show("Error occurred in Sub LogCommentBtn_Click: " & ex.Message)
+        End Try
+
+    End Sub
+
+    Private Sub LogDevInfoBtn_Click(sender As Object, e As EventArgs) Handles LogDevInfoBtn.Click
+        'logs the device info
+        Try
+            SendToLog("", "Device Info, ")
+            SendToLog("", "Device Info, CTA-2045 Version, " & otherDeviceCTA2045Version.Text)
+            SendToLog("", "Device Info, Vendor ID, " & otherDeviceVendorID.Text)
+            SendToLog("", "Device Info, Device Type, " & otherDeviceDeviceType.Text)
+            SendToLog("", "Device Info, Device Revision, " & otherDeviceDeviceRevision.Text)
+            SendToLog("", "Device Info, Capability Bitmap, " & otherDeviceCapabilityBitmap.Text)
+            SendToLog("", "Device Info, Model Number, " & otherDeviceModelNumber.Text)
+            SendToLog("", "Device Info, Serial Number, " & otherDeviceSerialNumber.Text)
+            SendToLog("", "Device Info, Firmware Date, " & otherDeviceFirmwareDate.Text)
+            SendToLog("", "Device Info, Firmware Major, " & otherDeviceFirmwareMajor.Text)
+            SendToLog("", "Device Info, Firmware Minor, " & otherDeviceFirmwareMinor.Text)
+
+        Catch ex As Exception
+            MessageBox.Show("Error occurred in Sub LogDevInfoBtn_Click: " & ex.Message)
+        End Try
+
+    End Sub
+
+    Private Sub LogCommodity()
+        'logs all 8 commodity codes with corresponding values
+        Dim commStr(10) As String
+        Dim commodityCodes() As String = {"Electricity Consumed (W)", "Electricity Produced (W)", "Natrual Gas (cubic ft/hr)", "Water (gal/hr)", "Natural Gas (cubic m/hr)", "Water (liters/hr}", "Total Energy Storage Capacity (W-hr)", "Present Energy Storage Capacity (W-hr)", "Rated Max Consumption Level Electricity (W)", "Rated Max Production Level Electricity (W)"}
+        Dim codeChk(10) As Boolean
+        Dim timeStr As String = DateDiff("s", #1/1/2000#, Now) & Now.ToString(".fff")
+        Dim tempstring = (((Convert.ToDecimal(timeStr)) / 86400) + 36526).ToString
+        Dim timeInfo As String = timeStr & ", " & tempstring
+
+        codeChk(0) = CommodityChk0.Checked
+        codeChk(1) = CommodityChk1.Checked
+        codeChk(2) = CommodityChk2.Checked
+        codeChk(3) = CommodityChk3.Checked
+        codeChk(4) = CommodityChk4.Checked
+        codeChk(5) = CommodityChk5.Checked
+        codeChk(6) = CommodityChk6.Checked
+        codeChk(7) = CommodityChk7.Checked
+        codeChk(8) = CommodityChk8.Checked
+        codeChk(9) = CommodityChk9.Checked
+
+        ' TODO : Add a check to confirm that all variable have same length
+
+        For I = 0 To 9
+            commStr(I) = timeInfo & ", Commodity Code: ," & I & ", " & commodityCodes(I) & ", Instantaneous Rate, " & commodityArray2(I).instRate & ", Cummulative Amount, "
+            commStr(I) &= commodityArray2(I).cumAmount & ", Update Frequency (s), " & commodityArray2(I).updateFreq & ", Estimated, "
+            commStr(I) &= commodityArray2(I).estimated & ", Supported, " & commodityArray2(I).supported
+        Next I
+
+        For J = 0 To 9
+            If codeChk(J) = True Then
+                SendToLog("", commStr(J))
+            End If
+        Next J
+    End Sub
+
+    Private Sub CommodityIntervalChkBox_CheckedChanged(sender As Object, e As EventArgs) Handles CommodityIntervalChkBox.CheckedChanged
+        'activate/deactivate commodity interval update
+        autoCommodityReadTimer.Interval = CommodityIntervalVal.Value * 1000
+        ' assgin the change in checkbox to the timer
+        autoCommodityReadTimer.Enabled = CommodityIntervalChkBox.Checked
+    End Sub
+
+    Private Sub AutoCommodityReadTimer_Tick(sender As Object, e As EventArgs) Handles autoCommodityReadTimer.Tick
+        Dim xmitBuffer(8) As Byte
+        'Get Commodity Read Request at each tick
+        Try
+            receiveIndex = 0
+            xmitBuffer(0) = 8
+            xmitBuffer(1) = 2
+            xmitBuffer(2) = 0
+            xmitBuffer(3) = 2
+            xmitBuffer(4) = &H6
+            xmitBuffer(5) = 0
+            pendingLinkAck = True
+            pendingAck = 0
+            SendComData(xmitBuffer, 6, "Sent Get Commodity Read Request", pendingLinkAck)
+            expectingResponse = True
+
+        Catch ex As Exception
+            MessageBox.Show("Error occured in Sub pbGetCommodity_Click: " & ex.Message)
+        End Try
+
+    End Sub
+
+    Private Sub CommodityIntervalVal_ValueChanged(sender As Object, e As EventArgs) Handles CommodityIntervalVal.ValueChanged
+        'changes interval for commodity updates
+        autoCommodityReadTimer.Interval = CommodityIntervalVal.Value * 1000
+    End Sub
+
+    Private Sub OpStateQueryCheck_CheckedChanged(sender As Object, e As EventArgs) Handles OpStateQueryCheck.CheckedChanged
+        'activates/deactivates timed query for op state
+        autoOpStateTimer.Interval = OpStateIntervalVal.Value * 1000
+
+        If OpStateQueryCheck.Checked = True Then
+            autoOpStateTimer.Enabled = True
+        Else
+            autoOpStateTimer.Enabled = False
+        End If
+
+    End Sub
+
+    Private Sub OpStateIntervalVal_ValueChanged(sender As Object, e As EventArgs) Handles OpStateIntervalVal.ValueChanged
+        'changes interval for op state updates
+        autoOpStateTimer.Interval = OpStateIntervalVal.Value * 1000
+    End Sub
+
+    Private Sub AutoOpStateTimer_Tick(sender As Object, e As EventArgs) Handles autoOpStateTimer.Tick
+        'op state query at each tick
+        Dim xmitBuffer(8) As Byte
+        Dim rtnval As Integer
+
+        tmrProcessComm.Enabled = False
+        receiveIndex = 0
+        xmitBuffer(0) = 8
+        xmitBuffer(1) = 1
+        xmitBuffer(2) = 0
+        xmitBuffer(3) = 2
+        xmitBuffer(4) = &H12
+        xmitBuffer(5) = 0
+        pendingLinkAck = True
+        pendingAck = &H12  'Set the pendingAck
+        SendComData(xmitBuffer, 6, "Sent Op State Query", pendingLinkAck)
+        expectingResponse = True
+
+        If GetLinkAck() = 0 Then
+            'Wait for State Query Response
+            rtnval = GetStateQueryResp()
+        End If
+        Reset_state()
+        tmrProcessComm.Enabled = True
+
+    End Sub
+
+    Private Sub GrphCommodityBtn_Click(sender As Object, e As EventArgs) Handles GrphCommodityBtn.Click
+        'opens commodity graph window
+        CommodityChart.Show()
+    End Sub
+
+    Public Sub GraphCommodityUpdate()
+        'updates commodity graph data
+        For I = 0 To 7
+            CommodityChart.InstAmChrt.Series(I).Points.AddXY(DateAndTime.Now, commodityArray2(I).instRate)
+            CommodityChart.CumAmChrt.Series(I).Points.AddXY(DateAndTime.Now, commodityArray2(I).cumAmount)
+        Next
+    End Sub
+
+    Private Sub ChkAllCommodity_Click(sender As Object, e As EventArgs) Handles ChkAllCommodity.Click
+        'boolean variable for check all commodity btn
+        Static Dim allChk As Boolean = False
+        'activates all check boxes for loging commodities
+
+        If allChk = False Then
+            CommodityChk0.Checked = True
+            CommodityChk1.Checked = True
+            CommodityChk2.Checked = True
+            CommodityChk3.Checked = True
+            CommodityChk4.Checked = True
+            CommodityChk5.Checked = True
+            CommodityChk6.Checked = True
+            CommodityChk7.Checked = True
+            CommodityChk8.Checked = True
+            CommodityChk9.Checked = True
+        Else
+            CommodityChk0.Checked = False
+            CommodityChk1.Checked = False
+            CommodityChk2.Checked = False
+            CommodityChk3.Checked = False
+            CommodityChk4.Checked = False
+            CommodityChk5.Checked = False
+            CommodityChk6.Checked = False
+            CommodityChk7.Checked = False
+            CommodityChk8.Checked = False
+            CommodityChk9.Checked = False
+        End If
+        allChk = Not allChk
+
+    End Sub
+
+    Private Sub AddHeaderBtn_Click(sender As Object, e As EventArgs) Handles AddHeaderBtn.Click
+        'opens test header window
+        TestHeader.Show()
+    End Sub
+
+    Private Sub SendOpStateBtn_Click(sender As Object, e As EventArgs) Handles SendOpStateBtn.Click
+        Dim xmitBuffer(8) As Byte
+        Dim rtnval As Integer
+
+        tmrProcessComm.Enabled = False
+        receiveIndex = 0
+        xmitBuffer(0) = 8
+        xmitBuffer(1) = 1
+        xmitBuffer(2) = 0
+        xmitBuffer(3) = 2
+        pendingAck = &H13  'Set the pendingAck
+        pendingLinkAck = True  'Set the pendingLinkAck to true
+        xmitBuffer(4) = &H13
+        xmitBuffer(5) = OpStateBox.SelectedIndex
+        SendComData(xmitBuffer, 6, "Sent Operational State Query response", pendingLinkAck)
+        expectingResponse = True
+
+        rtnval = GetLinkAck()
+        If rtnval = 0 Then
+            'Wait for Application Ack
+            rtnval = GetApplicationAck(&H13)
+        End If
+        Reset_state()
+        tmrProcessComm.Enabled = True
+    End Sub
+
+    Private Sub SendPendEventTypePb_Click(sender As Object, e As EventArgs) Handles sendPendEventTypePb.Click
+        Dim xmitBuffer(8) As Byte
+        Dim temp As Byte
+        Dim rtnval As Integer
+
+        tmrProcessComm.Enabled = False
+        receiveIndex = 0
+        xmitBuffer(0) = 8
+        xmitBuffer(1) = 1
+        xmitBuffer(2) = 0
+        xmitBuffer(3) = 2
+        xmitBuffer(4) = &H19
+        If pendEventTypeCb.SelectedIndex = 0 Then   'Shed
+            temp = &H1
+        ElseIf pendEventTypeCb.SelectedIndex = 1 Then   'End Shed
+            temp = &H2
+        ElseIf pendEventTypeCb.SelectedIndex = 2 Then   'Critical peak
+            temp = &HA
+        ElseIf pendEventTypeCb.SelectedIndex = 3 Then   'Grid emergency
+            temp = &HB
+        ElseIf pendEventTypeCb.SelectedIndex = 4 Then   'Load up
+            temp = &H17
+        End If
+        xmitBuffer(5) = temp
+        SendComData(xmitBuffer, 6, "Sent Pending event type: " & temp, pendingLinkAck)
+        expectingResponse = True
+
+        rtnval = GetLinkAck()
+        If rtnval = 0 Then
+            'Wait for Application Ack
+            rtnval = GetApplicationAck(&H19)
+        End If
+        Reset_state()
+        tmrProcessComm.Enabled = True
+
+    End Sub
+
+    Private Sub SendPendEventTimePb_Click(sender As Object, e As EventArgs) Handles sendPendEventTimePb.Click
+        Dim xmitBuffer(8) As Byte
+        Dim rtnval As Integer
+
+        tmrProcessComm.Enabled = False
+        receiveIndex = 0
+        xmitBuffer(0) = 8
+        xmitBuffer(1) = 1
+        xmitBuffer(2) = 0
+        xmitBuffer(3) = 2
+        xmitBuffer(4) = &H18
+        xmitBuffer(5) = trkPendEventDuration.Value
+        SendComData(xmitBuffer, 6, "Sent Pending Event Time Command", pendingLinkAck)
+        expectingResponse = True
+
+        rtnval = GetLinkAck()
+        If rtnval = 0 Then
+            'Wait for Application Ack
+            rtnval = GetApplicationAck(&H18)
+        End If
+        Reset_state()
+        tmrProcessComm.Enabled = True
+
+    End Sub
+
+    Private Sub TrkPendEventDuration_Scroll(sender As Object, e As EventArgs) Handles trkPendEventDuration.Scroll
+        Dim duration As Long
+        Dim durHours As Byte
+        Dim durMin As Byte
+        Dim durSec As Byte
+
+        If trkPendEventDuration.Value = 0 Then
+            txtPendDuration.Text = "Unknown"
+        ElseIf trkPendEventDuration.Value = &HFF Then
+            txtPendDuration.Text = ("> Maximum")
+        Else
+            duration = (trkPendEventDuration.Value * trkPendEventDuration.Value) * 2
+            durHours = duration \ 3600
+            durMin = (duration Mod 3600) \ 60
+            durSec = duration Mod 60
+            txtPendDuration.Text = durHours.ToString("00") & ":" & durMin.ToString("00") & ":" & durSec.ToString("00")
+        End If
+
+    End Sub
+
+    Private Sub BReboot_Click(sender As Object, e As EventArgs) Handles bReboot.Click
+        Dim xmitBuffer(8) As Byte
+        Dim rtnval As Integer
+
+        tmrProcessComm.Enabled = False
+        receiveIndex = 0
+        xmitBuffer(0) = 8
+        xmitBuffer(1) = 1
+        xmitBuffer(2) = 0
+        xmitBuffer(3) = 2
+        xmitBuffer(4) = &H1A
+        xmitBuffer(5) = cbRebootType.SelectedIndex
+        SendComData(xmitBuffer, 6, "Sent Reboot Command", pendingLinkAck)
+        'xmitBuffer(4) = &H11
+        'xmitBuffer(5) = 0
+        'SendComData(xmitBuffer, 6, "Sent Customer Override Not in Effect", pendingLinkAck)
+        expectingResponse = True
+
+        rtnval = GetLinkAck()
+        If rtnval = 0 Then
+            'Wait for Application Ack
+            rtnval = GetApplicationAck(&H1A)
+            'rtnval = getApplicationAck(&H11)
+        End If
+        Reset_state()
+        tmrProcessComm.Enabled = True
+
+    End Sub
+
+    Private Sub PbSetPrefLevel_Click(sender As Object, e As EventArgs) Handles pbSetPrefLevel.Click
+        Dim xmitBuffer(16) As Byte
+
+        'Build Msg
+        xmitBuffer(0) = 8
+        xmitBuffer(1) = 2
+        xmitBuffer(2) = 0
+        xmitBuffer(3) = 4
+        xmitBuffer(4) = &HB
+        xmitBuffer(5) = 1
+        xmitBuffer(6) = nudPrefType.Value     'Preference type
+        xmitBuffer(7) = nudPrefLevel.Value     'Preference level
+        'Send Msg
+        pendingLinkAck = True
+        SendComData(xmitBuffer, 8, "Sent Set User Preference Level Request", pendingLinkAck)
+        expectingResponse = True
+
+    End Sub
+
+    Private Sub PbGetPrefLevel_Click(sender As Object, e As EventArgs) Handles pbGetPrefLevel.Click
+        Dim xmitBuffer(16) As Byte
+
+        'Build Msg
+        xmitBuffer(0) = 8
+        xmitBuffer(1) = 2
+        xmitBuffer(2) = 0
+        xmitBuffer(3) = 3
+        xmitBuffer(4) = &HB
+        xmitBuffer(5) = 0
+        xmitBuffer(6) = nudPrefType.Value     'Preference type
+        'Send Msg
+        pendingLinkAck = True
+        SendComData(xmitBuffer, 7, "Sent Get User Preference Level Request", pendingLinkAck)
+        expectingResponse = True
+
+    End Sub
+
+    Private Sub NudPrefLevel_ValueChanged(sender As Object, e As EventArgs) Handles nudPrefLevel.ValueChanged
+        preference(nudPrefType.Value) = nudPrefLevel.Value
+    End Sub
+
+    Private Sub NudPrefType_ValueChanged(sender As Object, e As EventArgs) Handles nudPrefType.ValueChanged
+        nudPrefLevel.Value = preference(nudPrefType.Value)
+    End Sub
+
+    Private Sub NudActIndex_ValueChanged(sender As Object, e As EventArgs) Handles nudActIndex.ValueChanged
+        nudActStatus.Value = actStatus(nudActIndex.Value)
+    End Sub
+
+    Private Sub NudActStatus_ValueChanged(sender As Object, e As EventArgs) Handles nudActStatus.ValueChanged
+        actStatus(nudActIndex.Value) = nudActStatus.Value
+    End Sub
+
+    Private Sub PbSetActStatus_Click(sender As Object, e As EventArgs) Handles pbSetActStatus.Click
+        Dim tempByte As Byte
+        Dim i As Integer
+        Dim idx As Integer = 8 'Setting Text index
+        Dim xmitBuffer(idx) As Byte
+
+        'Build Msg
+        xmitBuffer(0) = 8
+        xmitBuffer(1) = 2
+        xmitBuffer(2) = 0
+        xmitBuffer(3) = 4
+        xmitBuffer(4) = &HA
+        xmitBuffer(5) = 1
+        xmitBuffer(6) = nudActIndex.Value     'Activation Index
+        xmitBuffer(7) = nudActStatus.Value     'Activation Status
+
+        Array.Resize(xmitBuffer, tbActivateKey.TextLength + idx)
+        If tbActivateKey.Text <> "" Then
+            For i = 1 To (tbActivateKey.TextLength)
+                tempByte = Asc(Mid(tbActivateKey.Text, i, 1))
+                xmitBuffer(idx) = tempByte
+                xmitBuffer(3) += 1
+                idx += 1
+            Next
+        End If
+        'Send Msg
+        pendingLinkAck = True
+        SendComData(xmitBuffer, xmitBuffer(3) + 4, "Sent Set Activation Status Request", pendingLinkAck)
+        expectingResponse = True
+
+    End Sub
+
+    Private Sub PbGetActStatus_Click(sender As Object, e As EventArgs) Handles pbGetActStatus.Click
+        Dim xmitBuffer(16) As Byte
+
+        'Build Msg
+        xmitBuffer(0) = 8
+        xmitBuffer(1) = 2
+        xmitBuffer(2) = 0
+        xmitBuffer(3) = 3
+        xmitBuffer(4) = &HA
+        xmitBuffer(5) = 0
+        xmitBuffer(6) = nudActIndex.Value     'Activation Index
+        'Send Msg
+        pendingLinkAck = True
+        SendComData(xmitBuffer, 7, "Sent Get Activation Status Request", pendingLinkAck)
+        expectingResponse = True
+
+    End Sub
+
+    Private Sub ChkCustOverride_CheckedChanged_1(sender As Object, e As EventArgs) Handles chkCustOverride.CheckedChanged
+        Dim xmitBuffer(8) As Byte
+        Dim rtnval As Integer
+
+        If ignoreOverrideChange = False Then
+            tmrProcessComm.Enabled = False
+            CustomerOverride = chkCustOverride.Checked
+            receiveIndex = 0
+            xmitBuffer(0) = 8
+            xmitBuffer(1) = 1
+            xmitBuffer(2) = 0
+            xmitBuffer(3) = 2
+            xmitBuffer(4) = &H11
+            If chkCustOverride.Checked = True Then
+                xmitBuffer(5) = 1
+                SendComData(xmitBuffer, 6, "Sent Customer Override in Effect", pendingLinkAck)
+                overRideSet = True
+            Else
+                xmitBuffer(5) = 0
+                SendComData(xmitBuffer, 6, "Sent Customer Override Not in Effect", pendingLinkAck)
+                overRideSet = False
+            End If
+            expectingResponse = True
+
+            rtnval = GetLinkAck()
+            If rtnval = 0 Then
+                'Wait for Application Ack
+                rtnval = GetApplicationAck(&H11)
+            End If
+            Reset_state()
+            tmrProcessComm.Enabled = True
+        Else
+            ignoreOverrideChange = False
+        End If
+
+    End Sub
+
+    Private Sub PbPowerLimit_Click(sender As Object, e As EventArgs) Handles pbPowerLimit.Click
+        Dim xmitBuffer(8) As Byte
+        Dim rtnval As Integer
+        Dim dispString As String
+
+        dispString = ""
+        xmitBuffer(0) = 8
+        xmitBuffer(1) = 3
+        xmitBuffer(2) = 0
+        xmitBuffer(3) = 2
+        xmitBuffer(4) = &H16
+        xmitBuffer(5) = nudPowerLimit.Value
+        pendingAck = 0  'Set the pendingAck to nothing
+        pendingLinkAck = True  'Set the pendingLinkAck to true
+        SendComData(xmitBuffer, 6, "Sent Power Limit request", pendingLinkAck)
+        rtnval = GetLinkAck()
+        If rtnval = 0 Then
+            SendToLog(dispString, "Power Limit request approved")
+            ReceivedText(dispString, "Power Limit request approved")
+        Else
+            SendToLog(dispString, "Power Limit request denied")
+            ReceivedText(dispString, "Power Limit request denied")
+        End If
+        Reset_state()
+    End Sub
+
+    ''' <summary>
+    ''' 
+    ''' </summary>
+    ''' <param name="sender"></param>
+    ''' <param name="e"></param>
+    ''' <param name="delay"></param>
+    Public Sub AdditonalInfo(sender As Object, e As EventArgs, Optional ByVal delay As Integer = 500)
+        ' Perform click to request the maximum payload size of other device and adjust payload size
+        TabSwitcher(deviceInfoTabControl, getDeviceInfo)
+        BtnMaxPayload_Click(sender, e)
+        WaistProcessorTime()
+        MaxPayloadSize = MaxPayloadSizeCd
+
+        '' Getting Connected Device Info
+        devInfoTimer = New Windows.Forms.Timer With {
+            .Interval = delay
+        }
+        AddHandler devInfoTimer.Tick, AddressOf QueryDeviceInfoButton_Click
+        devInfoTimer.Start()
+
+        '' Logging Connected Device Info
+        AddHandler devInfoTimer.Tick, AddressOf LogDevInfoBtn_Click
+        devInfoTimer.Start()
+    End Sub
+
+    ''' <summary>
+    ''' 
+    ''' </summary>
+    ''' <param name="sender"></param>
+    ''' <param name="e"></param>
+    Private Sub StopEvent(sender As Object, e As EventArgs) Handles devInfoTimer.Tick
+        devInfoTimer.Stop()
+    End Sub
+
+    ''' <summary>
+    ''' 
+    ''' </summary>
+    ''' <param name="parentTab"></param>
+    ''' <param name="targetTab"></param>
+    ''' <param name="sleep"></param>
+    Private Sub TabSwitcher(parentTab As TabControl, targetTab As TabPage, Optional ByVal sleep As Integer = 500)
+        simulatorDeviceTypeTabControl.SelectTab(parentTab.Parent)
+        parentTab.SelectTab(targetTab)
+        WaistProcessorTime(sleep) ' Wait for half a Second
+    End Sub
+
+    ''' <summary>
+    ''' 
+    ''' </summary>
+    ''' <param name="sender"></param>
+    ''' <param name="e"></param>
+    Private Sub GenReportBtn_Click(sender As Object, e As EventArgs) Handles GenReportBtn.Click
+        ' TODO : might give issues in case the log file is disabled
+        TestReport.Show()
+    End Sub
+
+    ''' <summary>
+    ''' 
+    ''' </summary>
+    ''' <param name="timeout"></param>
+    ''' <returns></returns>
+    Public Function WaistProcessorTime(Optional ByVal timeout As ULong = 150) As Boolean
+        Dim cycles As ULong = 0
+        Dim max_time = timeout * GetCPUSpeed() / 1000 ' it takes # cycle per second
+        Do
+            cycles += 1
+        Loop Until cycles >= max_time
+        WaistProcessorTime = cycles <> 0
+    End Function
+
+    ''' <summary>
+    ''' 
+    ''' </summary>
+    ''' <returns>The Current Speed of the Processor</returns>
+    Private Function GetCPUSpeed() As ULong
+        Dim CPUSpeed As ULong
+        Try
+            Dim hkey = My.Computer.Registry.GetValue("HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\CentralProcessor\0", "~MHz", Nothing)
+            CPUSpeed = Math.Pow(2, 10) * Convert.ToInt64(hkey, 16)
+        Catch
+            CPUSpeed = Math.Pow(10, 6) ' Minimum CPU Requirments for Win 7 & UP
+        End Try
+        GetCPUSpeed = CPUSpeed
+    End Function
+
+    ''' <summary>
+    ''' 
+    ''' </summary>
+    ''' <param name="sender"></param>
+    ''' <param name="e"></param>
+    Private Sub CloseBTN_Click(sender As Object, e As EventArgs) Handles CloseBTN.Click
+        Me.Close()
+    End Sub
+
+    ''' <summary>
+    ''' 
+    ''' </summary>
+    ''' <param name="sender"></param>
+    ''' <param name="e"></param>
+    Private Sub CbAutoStartup_CheckedChanged(sender As Object, e As EventArgs) Handles cbAutoStartup.CheckedChanged
+        Dim msgList As String() = {"08 01", "08 02", "08 03", "08 04", "09 01", "09 02", "09 03", "09 04", "09 05", "09 06", "09 07", "09 08", "09 09", "09 0A", "09 0B", "09 0C"}
+        Dim rdsState = cbResponseSim.Checked ' Preserving RDS CB state
+
+        If cbAutoStartup.Checked And btnDisconnect.Enabled Then
+            '' Enable RDS CB
+            If rdsState = False Then cbResponseSim.Checked = Not rdsState
+
+            If rbMode1.Checked = True Then
+                ' Perform click to send good communication status 
+                SendCommStatus(1) '"Found / Good Connection"
+
+                ' Perform click to request operational state of connected device
+                PbOpState_Click(sender, e)
+            ElseIf rbMode2.Checked Then
+                ' Perform click to send current device's operational state
+                SendOpStateBtn_Click(sender, e)
+            End If
+
+            ' Perform Click to verify all message type supported and add to list
+            supportedMsgTypeList.Items.Clear()
+            For Each msg In msgList
+                nudSupMsgQueryMSB.Value = Convert.ToInt32(msg.Substring(0, 2), 16).ToString()
+                nudSupMsgQueryLSB.Value = Convert.ToInt32(msg.Substring(4), 16).ToString()
+                WaistProcessorTime()
+
+                MsgTypeQuery_Click(sender, e)
+                supportedMsgTypeList.Items.Add("0x" & Convert.ToInt32(nudSupMsgQueryMSB.Value).ToString("X") & " 0x" & Convert.ToInt32(nudSupMsgQueryLSB.Value).ToString("X"))
+                WaistProcessorTime()
+            Next
+
+            ''Getting Other Device Information
+            If ODMsgTypeSup.Items.Contains("0x8 0x2") Then
+                QueryDeviceInfoButton_Click(sender, e)
+                WaistProcessorTime()
+            End If
+
+            ''Getting Maximum Payload Size of Connected Device
+            If ODMsgTypeSup.Items.Contains("0x8 0x3") Then
+                BtnMaxPayload_Click(sender, e)
+                WaistProcessorTime()
+                MaxPayloadSize = MaxPayloadSizeCd
+            End If
+
+            cbResponseSim.Checked = rdsState ' Restoring RDS CB state
+        End If
+    End Sub
+
+    ''' <summary>
+    ''' 
+    ''' </summary>
+    ''' <param name="sender"></param>
+    ''' <param name="e"></param>
+    Private Sub AboutCTA2045SimulatorToolStripMenuItem_Click(sender As Object, e As EventArgs) Handles AboutCTA2045SimulatorToolStripMenuItem.Click
+        AboutBox.ShowDialog()
+    End Sub
+
+    ''' <summary>
+    ''' 
+    ''' </summary>
+    ''' <param name="sender"></param>
+    ''' <param name="e"></param>
+    Private Sub ViewHelpContentToolStripMenuItem_Click(sender As Object, e As EventArgs) Handles ViewHelpContentToolStripMenuItem.Click
+        Dim GetFile = Function() As String
+                          Dim parentLevel As Short = 1
+                          Dim targetDir = Directory.GetCurrentDirectory()
+                          Dim rootDir = Directory.GetDirectoryRoot(targetDir)
+                          While parentLevel < 5
+                              Dim chmFile = Directory.GetFiles(targetDir, "CTA-2045_Simulator_User_Guide.chm", SearchOption.AllDirectories)
+                              If chmFile.Length > 0 Then Return chmFile.Last
+                              If targetDir.Equals(rootDir) Then Exit While
+                              targetDir = Directory.GetParent(targetDir).FullName
+                              parentLevel += 1
+                          End While
+                          Return String.Empty
+                      End Function
+
+        Try
+            Help.ShowHelp(Me, GetFile())
+        Catch ex As Exception
+            MessageBox.Show(ex.Message, "Help Content", MessageBoxButtons.OK, MessageBoxIcon.Error)
+        End Try
+    End Sub
 End Class
