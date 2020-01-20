@@ -27,7 +27,7 @@ The step by step instructions to build the executable can be found in the user m
 Once run, the executable will either start the simulator or start a setup wizard before starting the simulator.
 
 ## Getting Executable from repository
-The executables built from Visual Studio were archived into https://github.com/epri-dev/CTA-2045-Desktop-Simulator/archives/CTA-2045-A.zip (this link needs to be updated)
+The executables built from Visual Studio were archived into [CTA-2045-A.zip](https://github.com/epri-dev/CTA-2045-Desktop-Simulator/releases/download/19.08.22/CTA-2045-A.zip) 
 * Download and extract CTA-2045-A.zip to a local directory
 * Navigate to the local directory
 * The executable files are at "publish/setup.exe", "obj/x86/Debug/CTA2045Sim.exe", "obj/x86/Release/CTA2045Sim.exe", "bin/Release/CTA2045Sim.exe" or "bin/Debug/CTA2045Sim.exe."
